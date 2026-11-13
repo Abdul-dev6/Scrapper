@@ -1,0 +1,43 @@
+{
+  "name": "lead-scraper-web",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "test:integration": "node --import tsx --experimental-test-module-mocks --test --test-concurrency=1 tests/integration/*.test.ts",
+    "db:indexes": "tsx --env-file=.env.local scripts/sync-indexes.ts",
+    "seed:user": "tsx --env-file=.env.local scripts/seed-user.ts",
+    "db:backup": "tsx --env-file=.env.local scripts/backup-db.ts",
+    "db:migrate:contacts": "tsx --env-file=.env.local scripts/migrate-contact-status.ts",
+    "db:restore": "tsx --env-file=.env.local scripts/restore-db.ts"
+  },
+  "dependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "bcryptjs": "^2.4.3",
+    "exceljs": "^4.4.0",
+    "jose": "^5.10.0",
+    "mongoose": "^8.24.8",
+    "next": "^15.5.29",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.5",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.20.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "mongodb-memory-server": "^10.1.4",
+    "tailwindcss": "^4.3.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=20.11"
+  }
+}

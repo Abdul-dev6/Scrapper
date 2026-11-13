@@ -1,0 +1,10 @@
+# Step 1 (job loop) + Step 2 (OSM discovery) + Step 3 (website crawler) + Step 6 (Google Places)
+pymongo==4.10.1
+python-dotenv==1.0.1
+httpx==0.28.1
+tldextract==5.4.0
+beautifulsoup4==4.12.3
+phonenumbers==8.13.52
+dnspython==2.7.0
+# IANA time zones (Google's free monthly quota resets on the Pacific-time calendar month; Windows has no tz database)
+tzdata==2025.2

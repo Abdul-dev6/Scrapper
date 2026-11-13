@@ -1,0 +1,10 @@
+# Local MongoDB for development (optional; you can use Atlas directly).
+#   docker compose up -d
+# Then use MONGODB_URI=mongodb://localhost:27017 in web/.env.local and worker/.env
+services:
+  mongo:
+    image: mongo:7
+    ports: ["127.0.0.1:27017:27017"]   # bound to localhost only
+    volumes: [mongo-data:/data/db]
+volumes:
+  mongo-data:

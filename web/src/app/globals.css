@@ -1,0 +1,34 @@
+@import "tailwindcss";
+
+/* Design tokens. Palette from a boxing gym: chalk walls, ring-canvas blue, plain ink. */
+@theme {
+  --font-sans: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+
+  --color-chalk: #f3f4f1;     /* page background */
+  --color-surface: #ffffff;   /* tables, panels */
+  --color-ink: #1c2127;       /* text */
+  --color-muted: #5d6670;     /* secondary text */
+  --color-line: #d9dde1;      /* borders */
+  --color-canvas: #1f4fb5;    /* primary actions, active nav */
+  --color-canvas-dark: #173c8a;
+  --color-ok: #1e7a4c;
+  --color-warn: #8a5a00;
+  --color-bad: #b42318;
+}
+
+html { color-scheme: light; }
+body { background: var(--color-chalk); color: var(--color-ink); }
+
+/* The one bold move: page titles set wide and heavy, like gym signage. */
+.page-title {
+  font-stretch: 125%;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+}
+
+:focus-visible { outline: 2px solid var(--color-canvas); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
