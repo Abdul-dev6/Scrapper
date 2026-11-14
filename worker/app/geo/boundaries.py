@@ -2,8 +2,8 @@
 
   country  -> Natural Earth admin-0 shape (ISO_A2_EH; ISO_A2 is "-99" for e.g. France and Norway)
   admin1   -> union of Natural Earth admin-1 shapes whose gn_a1_code is the GeoNames region code
-              (e.g. US.WA); if none match (e.g. England, where NE has counties), the box around the
-              region's towns from the gazetteer, clipped to the country
+              (e.g. US.WA); else those of the same country whose `geonunit` is the region's name
+              (England = its 152 counties); else the box around the region's towns, clipped to the country
   city     -> the Natural Earth urban-area outline containing the town, if its size is plausible for
               the population; otherwise a circle sized by population; always clipped to the country
 
@@ -25,6 +25,7 @@ from shapely.ops import unary_union
 from shapely.prepared import prep
 
 from .data import DATASETS, GeoDataError, ensure
+from .text import norm
 
 REGION_MARGIN_DEG = 0.05
 
@@ -116,16 +117,25 @@ class Boundaries:
         finally:
             sf.close()
 
-    def admin1(self, cc: str, a1: str) -> BaseGeometry | None:
+    def admin1(self, cc: str, a1: str, name: str = "") -> tuple[BaseGeometry, str] | None:
+        """(shape, how it was matched) for a GeoNames region, or None."""
         sf = self._reader("ne_admin1")
         try:
             names = [f[0] for f in sf.fields[1:]]
-            col = names.index("gn_a1_code")
+            code_col = names.index("gn_a1_code")
             want = f"{cc}.{a1}"
-            idx = [i for i, rec in enumerate(sf.iterRecords()) if rec[col] == want]
+            recs = list(sf.iterRecords())
+            idx = [i for i, rec in enumerate(recs) if rec[code_col] == want]
+            how = "gn_a1_code"
+            if not idx and name and "geonunit" in names and "iso_a2" in names:
+                # e.g. England: NE has its counties, each labelled geonunit="England"
+                g_col, cc_col = names.index("geonunit"), names.index("iso_a2")
+                target = norm(name)
+                idx = [i for i, rec in enumerate(recs) if rec[cc_col] == cc and norm(rec[g_col] or "") == target]
+                how = "geonunit"
             if not idx:
                 return None
-            return unary_union([shape(sf.shape(i).__geo_interface__) for i in idx]).buffer(0)
+            return unary_union([shape(sf.shape(i).__geo_interface__) for i in idx]).buffer(0), how
         finally:
             sf.close()
 
@@ -163,9 +173,10 @@ class Boundaries:
                         {"source": "naturalearth-admin0", "id": cc, "version": self.versions["ne_admin0"]})
 
         if kind == "admin1":
-            geom = self.admin1(cc, place.get("admin1Code", ""))
+            found = self.admin1(cc, place.get("admin1Code", ""), place.get("name", ""))
+            geom = found[0] if found else None
             boundary = {"source": "naturalearth-admin1", "id": f"{cc}.{place.get('admin1Code')}",
-                        "version": self.versions["ne_admin1"]}
+                        "matchedBy": found[1] if found else None, "version": self.versions["ne_admin1"]}
             if geom is None:
                 b = place.get("cityBbox")
                 if not b:

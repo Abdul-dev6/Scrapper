@@ -115,11 +115,17 @@ def test_region_from_natural_earth_or_from_its_towns(test_boundaries):
     wa = test_boundaries.resolve({"_id": "admin1:US.WA", "kind": "admin1", "name": "Washington", "countryCode": "US",
                                   "admin1Code": "WA", "countryName": "United States"})
     assert wa.boundary["source"] == "naturalearth-admin1" and wa.contains(47.6, -122.3)
-    eng = test_boundaries.resolve({"_id": "admin1:GB.ENG", "kind": "admin1", "name": "England", "countryCode": "GB",
-                                   "admin1Code": "ENG", "countryName": "United Kingdom",
-                                   "cityBbox": [50.0, -5.7, 55.8, 1.7]})
-    assert eng.boundary["source"] == "geonames-region-towns-bbox"
-    assert eng.contains(51.5, -0.1) and not eng.contains(57.5, -4.2)  # Inverness (Scotland) is outside
+    assert wa.boundary["matchedBy"] == "gn_a1_code"
+    england = {"_id": "admin1:GB.ENG", "kind": "admin1", "name": "England", "countryCode": "GB", "admin1Code": "ENG",
+               "countryName": "United Kingdom", "cityBbox": [50.0, -5.7, 55.8, 1.7]}
+    eng = test_boundaries.resolve(england)
+    assert eng.boundary["source"] == "naturalearth-admin1" and eng.boundary["matchedBy"] == "geonunit"
+    assert eng.contains(51.5, -0.1)  # London
+    assert not eng.contains(52.4, -4.0)  # Aberystwyth (Wales) is NOT in England, although it's in the towns' box
+    # A region Natural Earth knows nothing about: the box around its towns, clipped to the country.
+    other = test_boundaries.resolve({**england, "_id": "admin1:GB.XX", "name": "Nowhere-shire", "admin1Code": "XX",
+                                     "cityBbox": [52.0, -1.0, 53.0, 0.0]})
+    assert other.boundary["source"] == "geonames-region-towns-bbox" and other.contains(52.5, -0.5)
 
 
 def test_country_and_errors(test_boundaries):

@@ -71,9 +71,11 @@ def test_boundaries(tmp_path_factory):
             ([49.9, -8.0, 60.9, 1.8], ["United Kingdom", "GB"]),
             ([24.5, -125.0, 49.4, -66.9], ["United States", "US"]),
         ]),
-        "ne_admin1": _write_zip(d, "admin1", shapefile.POLYGON, [("name", "C", 40), ("gn_a1_code", "C", 12)], [
-            ([45.5, -124.8, 49.0, -116.9], ["Washington", "US.WA"]),
-            ([51.0, -1.0, 52.0, 0.5], ["Some county", "GB.Z9"]),
+        "ne_admin1": _write_zip(d, "admin1", shapefile.POLYGON,
+                                [("name", "C", 40), ("gn_a1_code", "C", 12), ("iso_a2", "C", 3), ("geonunit", "C", 40)], [
+            ([45.5, -124.8, 49.0, -116.9], ["Washington", "US.WA", "US", "United States of America"]),
+            ([50.0, -2.5, 55.8, 1.7], ["English county", "GB.Z9", "GB", "England"]),
+            ([51.4, -5.3, 53.4, -2.7], ["Welsh county", "GB.Y1", "GB", "Wales"]),
         ]),
         "ne_urban": _write_zip(d, "urban", shapefile.POLYGON, [("area_sqkm", "N", 12, 2)], [
             (LONDON_BOX, [2000.0]),
