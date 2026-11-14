@@ -1,7 +1,7 @@
 """The scraping pipeline for one job.
 
 Stages (progress bar):
-  geocode (Nominatim)                          0-10%
+  search area (offline: gazetteer place + Natural Earth boundary; no Nominatim)  0-10%
   discover (Overpass) -> save leads            10-60%   <- Step 2
      + Google Text Search in a parallel thread           <- Step 6 (only if the job asks for "google")
   merge Google results into leads                         <- Step 6
@@ -25,7 +25,8 @@ from .crawl import runner as crawl
 from .google import merge as google_merge
 from .google.runner import GoogleRun, make_usage
 from .google.usage import UsageLimiter
-from .osm import discovery, mapping, nominatim, overpass
+from .geo.boundaries import AreaError, Boundaries
+from .osm import discovery, mapping, overpass
 from .osm.ratelimit import RateLimiter
 
 
@@ -39,7 +40,6 @@ class TransientJobError(RuntimeError):
 
 TRANSIENT_ERRORS = (
     TransientJobError,
-    nominatim.GeocodeUnavailable,
     overpass.OverpassBusy,
     httpx.TransportError,
     mongo_errors.AutoReconnect,  # includes NetworkTimeout / connection failures
@@ -51,9 +51,22 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, TRANSIENT_ERRORS)
 
 
-# One limiter for the whole process: Nominatim allows max 1 request/second per application.
-NOMINATIM_LIMITER = RateLimiter(min_interval=1.1)
+# Kept for the run_job(limiter=...) signature; no rate-limited geocoding service is called any more.
+NOMINATIM_LIMITER = RateLimiter(min_interval=0)
 SAVE_PROGRESS_EVERY = 25
+_BOUNDARIES: Boundaries | None = None
+
+
+def boundaries() -> Boundaries:
+    """Pinned Natural Earth data, loaded once per worker process (tests replace this)."""
+    global _BOUNDARIES
+    if _BOUNDARIES is None:
+        _BOUNDARIES = Boundaries.from_pinned()
+    return _BOUNDARIES
+
+
+NEEDS_PLACE = ("This search was created before place selection. Start a new search and pick the place "
+               "from the list.")
 DISCOVER_SHARE = 50  # % of the bar for the map search; the website check gets the rest
 
 
@@ -119,27 +132,23 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
     # A retried or restarted job continues from its checkpoint instead of starting over.
     checkpoint = job.get("checkpoint") or {}
 
-    # 1. Where is the place?
-    progress(stage="Finding the location", pct=5)
-    place = checkpoint.get("place")
-    if place is None:
-        place = nominatim.geocode(
-            job["location"]["query"],
-            client=client,
-            cache=db.geocodeCache,
-            limiter=limiter,
-            url=settings.nominatim_url,
-            now=q.now(),
-            sleep=sleep,
-        )
-        q.save_checkpoint(jobs, job_id, "place", place)
+    # 1. Where is the place? The user picked it from the gazetteer; its area comes from pinned,
+    # offline boundary data (no external geocoding service). Same inputs -> same area, so a resumed
+    # job simply resolves it again.
+    progress(stage="Preparing the search area", pct=5)
+    picked = (job.get("location") or {}).get("place")
+    if not picked:
+        raise AreaError(NEEDS_PLACE)
+    area = boundaries().resolve(picked)
+    place = area.to_checkpoint()
     jobs.update_one(
         {"_id": job_id},
         {"$set": {
-            "location.displayName": place["displayName"],
-            "location.country": place["country"],
-            "location.countryCode": place["countryCode"],
-            "location.bbox": place["bbox"],
+            "location.displayName": area.display_name,
+            "location.country": area.country,
+            "location.countryCode": area.country_code,
+            "location.bbox": area.bbox,
+            "location.boundary": area.boundary,
         }},
     )
 
@@ -152,9 +161,11 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
     # 2 + 3. Search the area piece by piece and save each piece's businesses straight away,
     # so a long country search shows results early and a crash doesn't lose finished pieces.
     progress(stage="Searching OpenStreetMap", pct=10)
-    area_cc = place["countryCode"] if place["areaId"] else None
+    # Only places inside the area are kept (see below), so its country is a fact, not a guess.
+    area_cc = area.country_code or None
     hashes = suppression.load_hashes(db.suppressionList, owner_id)
-    stats = dict.fromkeys(("discovered", "withWebsite", "newLeads", "updated", "merged", "duplicates", "suppressed"), 0)
+    stats = dict.fromkeys(("discovered", "withWebsite", "newLeads", "updated", "merged", "duplicates", "suppressed",
+                           "outsideArea"), 0)
     seen: set[str] = set()
     processed = element_failures = pieces_ok = pieces_failed = 0
     last_piece_error = ""
@@ -172,8 +183,9 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
 
     pieces = [] if saved_discovery.get("complete") else discovery.discover(
         job["categories"],
-        area_id=place["areaId"],
+        area_id=None,
         bbox=place["bbox"],
+        boxes=area.search_boxes(),
         client=client,
         url=settings.overpass_url,
         status_url=status_url(settings.overpass_url),
@@ -195,6 +207,10 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
         for i, element in enumerate(piece.elements, 1):
             processed += 1
             try:
+                point = element if "lat" in element else element.get("center") or {}
+                if "lat" in point and not area.contains(float(point["lat"]), float(point["lon"])):
+                    stats["outsideArea"] += 1  # inside the search box, but outside the chosen place
+                    continue
                 lead = mapping.element_to_lead(element, now=q.now(), area_country_code=area_cc)
                 if lead is None:
                     continue

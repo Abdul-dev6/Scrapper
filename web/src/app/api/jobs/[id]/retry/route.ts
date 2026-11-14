@@ -33,6 +33,11 @@ export async function POST(_req: Request, { params }: Ctx) {
     if (!RETRYABLE.includes(old.status ?? "")) {
       return jsonError(409, "Only failed, partial or cancelled jobs can be retried.");
     }
+    // Searches from before place selection have no picked place: the worker can't build an area for
+    // them (no public geocoder any more), so the user must start a new search and pick the place.
+    if (!old.location.place) {
+      return jsonError(409, "This search was created before place selection. Start a new search and pick the place from the list.");
+    }
     const limit = await jobLimitError(user.id);
     if (limit) return jsonError(429, limit);
 
@@ -43,7 +48,7 @@ export async function POST(_req: Request, { params }: Ctx) {
     const googleRemoved = (old.sources ?? []).includes("google");
     const job = await ScrapingJob.create({
       ownerId: user.id,
-      location: { query: old.location.query },
+      location: { query: old.location.query, place: old.location.place },
       categories: old.categories,
       sources,
       retryOf: old._id,

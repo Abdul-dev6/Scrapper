@@ -17,7 +17,7 @@ from datetime import datetime
 
 from pymongo.database import Database
 
-from ..osm.nominatim import cache_key
+from ..geo.text import area_key as cache_key
 
 
 def maps_url(place_id: str) -> str:

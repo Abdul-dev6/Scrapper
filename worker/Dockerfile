@@ -9,6 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# Phase 2a: download the pinned Natural Earth boundary files at BUILD time and verify their sha256
+# (app/geo/data.py). The build fails if a file doesn't match, so production never fetches them.
+ENV GEO_DATA_DIR=/app/geodata
+RUN python -m app.geo.data
+
 # never run as root
 RUN useradd --create-home --uid 10001 worker
 USER worker

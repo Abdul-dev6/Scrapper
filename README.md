@@ -132,6 +132,17 @@ Contact checks and retries (Phase 1, 2026-11-14):
   ~1, ~4, then ~16 minutes and continues where it stopped (finished map pieces aren't searched again). A page that
   times out or answers 429/5xx is retried once, politely.
 
+Place search and search areas (Phase 2a, 2026-11-14). No public Nominatim:
+- Find leads: type a place and press **Find place**. Matches come from the `gazetteer` collection (GeoNames,
+  CC BY 4.0); if several match (London GB / Ontario / Ohio...) you pick one. Nothing you type leaves the app.
+- Load or refresh the gazetteer (needs `npm run db:indexes` once). Download `cities1000.zip`, `countryInfo.txt`
+  and `admin1CodesASCII.txt` from https://download.geonames.org/export/dump/ into one folder, then
+  `cd worker && python -m app.geo.gazetteer load <folder>` (atomic swap; ~172k places, ~115 MB incl. index).
+- The worker builds the search area from the picked place with Natural Earth (public domain) shapes, pinned by
+  version + sha256 (`app/geo/data.py`): countries, regions, urban outlines, else a radius by population, always
+  clipped to the country. Places outside the area are dropped. The job records the boundary source and version.
+- Searches created before this change can't be retried (they have no picked place): start a new search.
+
 ## Build steps
 1. ✅ Setup, models + indexes, auth, job queue
 2. ✅ OpenStreetMap discovery (Nominatim + Overpass)

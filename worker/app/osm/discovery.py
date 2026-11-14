@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 import httpx
 
 from . import overpass
-from .nominatim import bbox_area_km2
+from ..geo.text import bbox_area_km2
 
 MIN_TILE_DEG = 0.05  # ~5 km; a piece this small is never "too heavy" in practice
 # Below ~25 km a "took too long" answer means the server is overloaded, not that the
@@ -97,6 +97,7 @@ def discover(
     max_queries: int,
     on_wait: Callable[[], None] = lambda: None,
     resume: dict | None = None,
+    boxes: list[list[float]] | None = None,
 ) -> Iterator[PieceResult]:
     """on_wait() is called before every query and every pause: the caller uses it as a
     heartbeat (so a long wait isn't mistaken for a crashed worker) and to notice Cancel.
@@ -122,7 +123,9 @@ def discover(
         done = float(resume.get("done", 0.0))
         queries = int(resume.get("queries", 0))
     else:
-        pending = deque(_with_shares(initial_tiles(bbox), 1.0))
+        # One box per landmass (boxes) avoids searching oceans between e.g. France and Réunion.
+        starts = [t for b in (boxes or [bbox]) for t in initial_tiles(b)]
+        pending = deque(_with_shares(starts, 1.0))
         done = 0.0
         queries = 0
     status_failures = 0

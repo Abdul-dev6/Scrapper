@@ -12,6 +12,10 @@ const jobSchema = new Schema(
       country: String,
       countryCode: String,
       bbox: { type: [Number], default: undefined }, // [south, west, north, east]
+      // Phase 2a: the gazetteer place the user picked (copied, so the job is reproducible) and the exact
+      // boundary data the worker used to build the search area (source, id, version).
+      place: { type: Schema.Types.Mixed, default: undefined },
+      boundary: { type: Schema.Types.Mixed, default: undefined },
     },
     categories: [{ type: String, enum: CATEGORY_IDS, required: true }],
     sources: [{ type: String, enum: SOURCES, required: true }],

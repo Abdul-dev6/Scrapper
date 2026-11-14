@@ -14,7 +14,8 @@ from app.crawl.fetcher import Fetcher, FetchError
 from app.crawl.robots import Robots
 from app.crawl.runner import make_async_client
 from app.main import process
-from app.osm.nominatim import GeocodeError, GeocodeUnavailable
+from app.geo.boundaries import AreaError
+from app.osm.overpass import OverpassBusy
 from app.pipeline import run_job
 from tests.conftest import FakeOSM, FakeWeb, add_job
 
@@ -56,9 +57,9 @@ def test_stale_job_is_requeued_with_backoff_and_keeps_its_checkpoint(db):
 
 
 @pytest.mark.parametrize("error,status", [
-    (GeocodeUnavailable("The location service is busy (HTTP 503)."), "queued"),  # temporary: retry later
+    (OverpassBusy("The OpenStreetMap search service is busy."), "queued"),  # temporary: retry later
     (httpx.ConnectError("network down"), "queued"),
-    (GeocodeError('Couldn\'t find "Atlantis".'), "failed"),  # permanent: retrying won't help
+    (AreaError("No boundary is available for Atlantis."), "failed"),  # permanent: retrying won't help
     (RuntimeError("bug"), "failed"),
 ])
 def test_temporary_errors_retry_permanent_errors_fail(db, monkeypatch, error, status):
@@ -122,7 +123,7 @@ def test_crashed_job_resumes_from_checkpoint_without_redoing_work(db, settings, 
                      web_transport=FakeWeb().transport())
 
     assert status == "completed"
-    assert fake.count("nominatim.test") == 1  # the place came from the checkpoint
+    assert fake.count("nominatim.test") == 0  # no external geocoding service, ever
     assert len(fake.queries()) - queries_before == 2  # only the 2 quarters that weren't finished
     assert db.leads.count_documents({}) == 4  # all four quarters, nothing twice
     done = db.scrapingJobs.find_one({"_id": job["_id"]})

@@ -19,11 +19,12 @@ let signSession: (p: { sub: string; email: string }) => Promise<string>;
 const alice = new Types.ObjectId();
 const mallory = new Types.ObjectId();
 const jobs = () => mongoose.connection.db!.collection("scrapingJobs");
+const LEEDS = "gn:2644688";
 
 async function oldJob(sources: string[], status = "failed") {
   const _id = new Types.ObjectId();
   await jobs().insertOne({
-    _id, ownerId: alice, location: { query: "London, UK" }, categories: ["gym"], sources, status,
+    _id, ownerId: alice, location: { query: "London, UK", place: { _id: "gn:2643743", kind: "city", name: "London" } }, categories: ["gym"], sources, status,
     createdAt: new Date("2026-10-01"), updatedAt: new Date("2026-10-01"),
   });
   return _id;
@@ -46,6 +47,9 @@ before(async () => {
   CREATE = (await import("../../src/app/api/jobs/route")).POST as unknown as typeof CREATE;
   ({ signSession } = await import("../../src/lib/session"));
   await (await import("../../src/lib/db")).connectDB();
+  await mongoose.connection.db!.collection("gazetteer").insertOne({
+    _id: LEEDS, kind: "city", name: "Leeds", countryCode: "GB", lat: 53.79648, lon: -1.54785, population: 455123, keys: ["leeds"], ctxKeys: ["uk"],
+  } as never);
 });
 
 beforeEach(async () => {
@@ -95,7 +99,7 @@ test("someone else's old Google job can't be retried", async () => {
 test("a new search without sources defaults to OSM only (Google off by default)", async () => {
   cookieValue = await signSession({ sub: String(alice), email: "x@test.test" });
   const res = await CREATE(new Request("http://test/api/jobs", {
-    method: "POST", body: JSON.stringify({ location: "Leeds, UK", categories: ["gym"] }),
+    method: "POST", body: JSON.stringify({ location: "Leeds, UK", placeId: LEEDS, categories: ["gym"] }),
   }));
   assert.equal(res.status, 201);
   const created = await jobs().findOne({ _id: new Types.ObjectId((await res.json()).job._id) });
@@ -116,7 +120,7 @@ test("the zod memory attack body is refused (413) before validation, using littl
 test("a sources array longer than the allowed sources is rejected", async () => {
   cookieValue = await signSession({ sub: String(alice), email: "x@test.test" });
   const res = await CREATE(new Request("http://test/api/jobs", {
-    method: "POST", body: JSON.stringify({ location: "Leeds, UK", categories: ["gym"], sources: ["osm", "osm", "osm"] }),
+    method: "POST", body: JSON.stringify({ location: "Leeds, UK", placeId: LEEDS, categories: ["gym"], sources: ["osm", "osm", "osm"] }),
   }));
   assert.equal(res.status, 400);
 });

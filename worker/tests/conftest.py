@@ -10,7 +10,6 @@ from app import jobs as q
 from app.config import Settings
 from app.osm.ratelimit import RateLimiter
 
-NOMINATIM = "https://nominatim.test/search"
 OVERPASS = "https://overpass.test/api/interpreter"
 OWNER = ObjectId()
 
@@ -31,6 +30,65 @@ def fake_dns(monkeypatch):
     monkeypatch.setattr(ssrf, "system_resolve", resolve)
 
 
+# The place the user picked (a gazetteer document, as the web app copies it onto the job).
+LONDON_PLACE = {
+    "_id": "gn:2643743", "kind": "city", "name": "London", "countryCode": "GB", "countryName": "United Kingdom",
+    "admin1Code": "ENG", "admin1Name": "England", "lat": 51.50853, "lon": -0.12574, "population": 8961989,
+}
+LONDON_BOX = [51.28, -0.51, 51.69, 0.33]  # [south, west, north, east] of the test urban outline
+
+
+def _write_zip(folder, name, shape_type, fields, rows):
+    """A tiny Natural-Earth-like shapefile zip (polygons given as [south, west, north, east] boxes)."""
+    import zipfile
+
+    import shapefile
+
+    base = folder / name
+    with shapefile.Writer(str(base), shapeType=shape_type) as w:
+        for f in fields:
+            w.field(*f)
+        for (s, west, n, e), rec in rows:
+            w.poly([[[west, s], [e, s], [e, n], [west, n], [west, s]]])
+            w.record(*rec)
+    zpath = folder / f"{name}.zip"
+    with zipfile.ZipFile(zpath, "w") as z:
+        for ext in ("shp", "shx", "dbf"):
+            z.write(f"{base}.{ext}", f"{name}.{ext}")
+    return zpath
+
+
+@pytest.fixture(scope="session")
+def test_boundaries(tmp_path_factory):
+    """Offline boundary data for tests: Great Britain, one US state, and London's urban outline."""
+    import shapefile
+
+    from app.geo.boundaries import Boundaries
+
+    d = tmp_path_factory.mktemp("geo")
+    paths = {
+        "ne_admin0": _write_zip(d, "admin0", shapefile.POLYGON, [("NAME", "C", 40), ("ISO_A2_EH", "C", 3)], [
+            ([49.9, -8.0, 60.9, 1.8], ["United Kingdom", "GB"]),
+            ([24.5, -125.0, 49.4, -66.9], ["United States", "US"]),
+        ]),
+        "ne_admin1": _write_zip(d, "admin1", shapefile.POLYGON, [("name", "C", 40), ("gn_a1_code", "C", 12)], [
+            ([45.5, -124.8, 49.0, -116.9], ["Washington", "US.WA"]),
+            ([51.0, -1.0, 52.0, 0.5], ["Some county", "GB.Z9"]),
+        ]),
+        "ne_urban": _write_zip(d, "urban", shapefile.POLYGON, [("area_sqkm", "N", 12, 2)], [
+            (LONDON_BOX, [2000.0]),
+        ]),
+    }
+    return Boundaries(paths, {"ne_admin0": "test-admin0", "ne_admin1": "test-admin1", "ne_urban": "test-urban"})
+
+
+@pytest.fixture(autouse=True)
+def offline_boundaries(monkeypatch, test_boundaries):
+    from app import pipeline
+
+    monkeypatch.setattr(pipeline, "_BOUNDARIES", test_boundaries)
+
+
 @pytest.fixture
 def db():
     return mongomock.MongoClient(tz_aware=True).db
@@ -41,7 +99,7 @@ def settings():
     return Settings(
         mongodb_uri="mongodb://test", mongodb_db="test", worker_id="w-test", poll_interval=0,
         stale_after=600, max_attempts=3, crawler_contact_url="https://lead-finder.test/crawler",
-        nominatim_url=NOMINATIM, overpass_url=OVERPASS, overpass_timeout=60, max_discovery_queries=200,
+        overpass_url=OVERPASS, overpass_timeout=60, max_discovery_queries=200,
         crawl_concurrency=5, crawl_delay=0, crawl_max_pages=5, crawl_timeout=5, crawl_recheck_days=7,
     )
 
@@ -54,7 +112,7 @@ def no_wait_limiter():
 def add_job(db, **over):
     doc = {
         "ownerId": OWNER,
-        "location": {"query": "London, UK"},
+        "location": {"query": "London, UK", "place": dict(LONDON_PLACE)},
         "categories": ["boxing_club"],
         "sources": ["osm"],
         "status": "queued",

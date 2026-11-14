@@ -4,6 +4,7 @@ import { connectDB } from "@/lib/db";
 import { jsonError, serverError, zodError, readJsonBody } from "@/lib/http";
 import { createJobSchema } from "@/lib/validators";
 import { JOB_LIST_FIELDS, jobLimitError } from "@/lib/jobs";
+import { placeForJob } from "@/lib/places";
 import { ScrapingJob } from "@/models";
 
 export async function GET(req: NextRequest) {
@@ -34,15 +35,18 @@ export async function POST(req: NextRequest) {
     if (!body.ok) return body.response;
     const parsed = createJobSchema.safeParse(body.data);
     if (!parsed.success) return zodError(parsed.error);
-    const { location, categories, sources } = parsed.data;
+    const { location, placeId, categories, sources } = parsed.data;
 
     await connectDB();
     const limit = await jobLimitError(user.id);
     if (limit) return jsonError(429, limit);
+    // The exact place the user picked; the worker builds the search area from this copy.
+    const place = await placeForJob(placeId);
+    if (!place) return jsonError(400, "That place wasn't found. Search again and pick it from the list.");
 
     const job = await ScrapingJob.create({
       ownerId: user.id,
-      location: { query: location },
+      location: { query: location, place },
       categories: [...new Set(categories)],
       sources: [...new Set(sources)],
     });

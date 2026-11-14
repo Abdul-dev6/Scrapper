@@ -5,3 +5,4 @@ export { Lead } from "./Lead";
 export { Suppression } from "./Suppression";
 export { GeocodeCache } from "./GeocodeCache";
 export { ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage } from "./GoogleUsage";
+export { Gazetteer, GazetteerMeta } from "./Gazetteer";

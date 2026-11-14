@@ -18,7 +18,6 @@ class Settings:
     stale_after: int
     max_attempts: int
     crawler_contact_url: str
-    nominatim_url: str = "https://nominatim.openstreetmap.org/search"
     overpass_url: str = "https://overpass-api.de/api/interpreter"
     overpass_timeout: int = 90  # seconds the server may spend on one piece before we split it
     max_discovery_queries: int = 2000  # safety cap per job; a big country needs far fewer
@@ -63,7 +62,6 @@ def load_settings() -> Settings:
         stale_after=int(os.getenv("STALE_AFTER_SECONDS", "600")),
         max_attempts=int(os.getenv("MAX_ATTEMPTS", "3")),
         crawler_contact_url=os.getenv("CRAWLER_CONTACT_URL", "").strip(),
-        nominatim_url=os.getenv("NOMINATIM_URL", d.nominatim_url),
         overpass_url=os.getenv("OVERPASS_URL", d.overpass_url),
         overpass_timeout=num("OVERPASS_TIMEOUT_SECONDS", d.overpass_timeout),
         max_discovery_queries=num("MAX_DISCOVERY_QUERIES", d.max_discovery_queries),

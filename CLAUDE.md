@@ -82,3 +82,5 @@ a new concept. Explain WHY a solution works, not only what changed.
    job checkpoints/resume, exponential backoff, crawler retry, Google off + no matching/export.
    Next: Phase 2 (GeoNames/Natural Earth geocoder, Geofabrik extracts), Phase 3 (Overture, non-OSM lane),
    then the Great Britain pilot. Each phase needs approval.
+8. 🟡 Phase 2a (branch phase-2-geocoder-extracts): offline place search (GeoNames gazetteer) + Natural Earth
+   search areas; Nominatim removed. Phase 2b next: Geofabrik extracts replace public Overpass.

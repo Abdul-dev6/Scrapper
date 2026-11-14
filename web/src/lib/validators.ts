@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { CATEGORY_IDS, SOURCES } from "./categories";
+import { PLACE_ID_RE } from "./placeText";
 
 export const loginSchema = z.object({
   email: z.string().trim().toLowerCase().email().max(254),
@@ -23,6 +24,8 @@ export const createJobSchema = z.object({
     .max(120)
     // letters (any language), digits, spaces and common address punctuation only
     .regex(/^[\p{L}\p{N}\s,.'()\-]+$/u, "Location contains unsupported characters"),
+  // The place the user picked from the search results (gazetteer id). Required: no free-text geocoding.
+  placeId: z.string().regex(PLACE_ID_RE, "Pick a place from the list"),
   categories: z.array(z.enum(CATEGORY_IDS)).min(1, "Pick at least one category").max(CATEGORY_IDS.length),
   sources: z.array(z.enum(SOURCES)).min(1).max(SOURCES.length).default(["osm"]),
 });

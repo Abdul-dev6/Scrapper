@@ -50,7 +50,10 @@ def test_end_to_end_saves_leads_with_sources(db, settings, no_wait_limiter):
 
     ua = fake.calls[0].headers["user-agent"]
     assert settings.crawler_contact_url in ua
-    assert "area(id:3600065606)" in fake.queries()[0]  # searched inside the geocoded area
+    assert "(51.28,-0.51,51.69,0.33)" in fake.queries()[0]  # searched the chosen place's area (offline boundary)
+    assert job["location"]["displayName"] == "London, England, United Kingdom"
+    assert job["location"]["boundary"]["source"] == "naturalearth-urban-area"
+    assert job["location"]["boundary"]["version"] == "test-urban"  # exact boundary version recorded
 
 
 def test_rerun_updates_instead_of_duplicating_and_keeps_user_fields(db, settings, no_wait_limiter):
@@ -73,11 +76,27 @@ def test_rerun_updates_instead_of_duplicating_and_keeps_user_fields(db, settings
     assert len(iron["jobIds"]) == 2 and iron["jobIds"][1] == job_id
 
 
-def test_geocode_cache_is_shared_between_jobs(db, settings, no_wait_limiter):
-    fake = FakeOSM(elements=ELEMENTS)
-    claim_and_run(db, settings, fake, no_wait_limiter)
-    claim_and_run(db, settings, fake, no_wait_limiter)
-    assert fake.count("nominatim.test") == 1 and fake.count("overpass.test") == 2
+def test_no_external_geocoding_and_places_outside_the_area_are_dropped(db, settings, no_wait_limiter):
+    # Returned by the map search, but outside London's outline (north of it).
+    outside = {"type": "node", "id": 9, "lat": 51.75, "lon": -0.40, "tags": {"name": "Watford Boxing", "sport": "boxing"}}
+    fake = FakeOSM(elements=[*ELEMENTS, outside])
+    _, status, job = claim_and_run(db, settings, fake, no_wait_limiter)
+    assert status == "completed"
+    assert fake.count("nominatim.test") == 0  # Nominatim is never called
+    assert job["stats"]["outsideArea"] == 1 and db.leads.count_documents({}) == 4
+    assert db.leads.count_documents({"externalIds.osm": "node/9"}) == 0
+    assert all(d["address"]["countryCode"] == "GB" for d in db.leads.find({"address": {"$exists": True}}))
+
+
+def test_job_without_a_picked_place_fails_with_a_clear_message(db, settings, no_wait_limiter):
+    from app.main import process
+
+    add_job(db, location={"query": "London, UK"})  # created before place selection existed
+    job = q.claim_next_job(db.scrapingJobs, "w1")
+    process(db, job, settings)
+    saved = db.scrapingJobs.find_one({"_id": job["_id"]})
+    assert saved["status"] == "failed"  # permanent: retrying can't fix it
+    assert "pick the place" in saved["progress"]["stage"]
 
 
 def test_suppressed_businesses_are_not_saved(db, settings, no_wait_limiter):
