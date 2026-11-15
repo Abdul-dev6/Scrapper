@@ -2,7 +2,7 @@
 
 Stages (progress bar):
   search area (offline: gazetteer place + Natural Earth boundary; no Nominatim)  0-10%
-  discover (Overpass) -> save leads            10-60%   <- Step 2
+  OpenStreetMap from Geofabrik extracts -> save leads  10-60%   <- Phase 2b (no public Overpass)
      + Google Text Search in a parallel thread           <- Step 6 (only if the job asks for "google")
   merge Google results into leads                         <- Step 6
   crawl websites -> extract -> verify -> merge 60-100%  <- Step 3
@@ -26,7 +26,8 @@ from .google import merge as google_merge
 from .google.runner import GoogleRun, make_usage
 from .google.usage import UsageLimiter
 from .geo.boundaries import AreaError, Boundaries
-from .osm import discovery, mapping, overpass
+from .osm import extracts as osm_extracts
+from .osm import mapping
 from .osm.ratelimit import RateLimiter
 
 
@@ -40,7 +41,7 @@ class TransientJobError(RuntimeError):
 
 TRANSIENT_ERRORS = (
     TransientJobError,
-    overpass.OverpassBusy,
+    osm_extracts.ExtractUnavailable,  # Geofabrik down / download broken: retried with backoff
     httpx.TransportError,
     mongo_errors.AutoReconnect,  # includes NetworkTimeout / connection failures
     mongo_errors.ServerSelectionTimeoutError,
@@ -78,11 +79,10 @@ def make_client(settings: Settings, transport: httpx.BaseTransport | None = None
     return httpx.Client(
         transport=transport,
         headers={"User-Agent": user_agent(settings)},
-        # Overpass may legitimately work for `overpass_timeout` seconds before answering.
-        # connect=10: a server that does not even accept the connection in 10 s is down; giving up
-        # quickly also means Cancel is noticed sooner.
-        timeout=httpx.Timeout(30.0, connect=10.0, read=settings.overpass_timeout + 30),
-        follow_redirects=True,
+        # Geofabrik: big streamed downloads. connect=15: a server that doesn't accept the connection
+        # is down; read=60: no byte for a minute = broken connection (resumed/retried safely).
+        timeout=httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0),
+        follow_redirects=False,  # followed explicitly: the dated extract URL is the version
     )
 
 
@@ -99,6 +99,7 @@ def run_job(
     host_resolve=None,
     google_transport: httpx.BaseTransport | None = None,
     usage: UsageLimiter | None = None,
+    extract_filter: osm_extracts.FilterFn | None = None,
 ) -> str:
     """Run a job and return its final status: 'completed' or 'partial'.
 
@@ -113,7 +114,7 @@ def run_job(
                        transport=google_transport, sleep=sleep)
     try:
         return _run(db, job, settings, client, sleep or time.sleep, limiter or NOMINATIM_LIMITER,
-                    web_transport, mx_resolve, google, host_resolve)
+                    web_transport, mx_resolve, google, host_resolve, extract_filter)
     finally:
         google.close()  # also stops the Google thread if the job was cancelled or crashed
         if own_client:
@@ -121,7 +122,8 @@ def run_job(
 
 
 def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, sleep, limiter,
-         web_transport=None, mx_resolve=None, google: GoogleRun | None = None, host_resolve=None) -> str:
+         web_transport=None, mx_resolve=None, google: GoogleRun | None = None, host_resolve=None,
+         extract_filter=None) -> str:
     jobs = db.scrapingJobs
     job_id, owner_id = job["_id"], job["ownerId"]
 
@@ -158,113 +160,127 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
         google.start(place["bbox"], q.now())
         jobs.update_one({"_id": job_id}, {"$set": {"google": {"mode": google.mode, "note": google.note}}})
 
-    # 2 + 3. Search the area piece by piece and save each piece's businesses straight away,
-    # so a long country search shows results early and a crash doesn't lose finished pieces.
-    progress(stage="Searching OpenStreetMap", pct=10)
-    # Only places inside the area are kept (see below), so its country is a fact, not a guess.
-    area_cc = area.country_code or None
+    # 2 + 3. OpenStreetMap from Geofabrik extracts (no public Overpass). Each job pins the exact,
+    # immutable extract versions it reads, start to end; progress is the element number inside
+    # those files, so a restarted job continues exactly there (never mixing two versions).
+    area_cc = area.country_code or None  # only places inside the area are kept, so this is a fact
     hashes = suppression.load_hashes(db.suppressionList, owner_id)
     stats = dict.fromkeys(("discovered", "withWebsite", "newLeads", "updated", "merged", "duplicates", "suppressed",
-                           "outsideArea"), 0)
+                           "outsideArea", "otherCategory"), 0)
     seen: set[str] = set()
-    processed = element_failures = pieces_ok = pieces_failed = 0
-    last_piece_error = ""
-    saved_discovery = checkpoint.get("discovery") or {}
-    if saved_discovery:  # resuming: keep counting from where the last attempt stopped
+    processed = element_failures = 0
+    # The cached extract holds every category (it is shared by all searches); like the old Overpass
+    # query, a job keeps only places matching at least one of ITS selected categories.
+    wanted = set(job.get("categories") or [])
+    saved = checkpoint.get("osm") or {}
+    if saved:  # resuming: keep counting from where the last attempt stopped
         stats.update({k: (job.get("stats") or {}).get(k, 0) for k in stats})
-        counters = saved_discovery.get("counters", {})
-        processed, element_failures = counters.get("processed", 0), counters.get("elementFailures", 0)
-        pieces_ok, pieces_failed = counters.get("piecesOk", 0), counters.get("piecesFailed", 0)
-        last_piece_error = counters.get("lastPieceError", "")
+        processed = saved.get("counters", {}).get("processed", 0)
+        element_failures = saved.get("counters", {}).get("elementFailures", 0)
 
-    def counters_now() -> dict:
-        return {"processed": processed, "elementFailures": element_failures, "piecesOk": pieces_ok,
-                "piecesFailed": pieces_failed, "lastPieceError": last_piece_error[:300]}
+    def counters() -> dict:
+        return {"processed": processed, "elementFailures": element_failures}
 
-    pieces = [] if saved_discovery.get("complete") else discovery.discover(
-        job["categories"],
-        area_id=None,
-        bbox=place["bbox"],
-        boxes=area.search_boxes(),
-        client=client,
-        url=settings.overpass_url,
-        status_url=status_url(settings.overpass_url),
-        sleep=sleep,
-        timeout=settings.overpass_timeout,
-        max_queries=settings.max_discovery_queries,
-        on_wait=progress,  # heartbeat + cancel check during long waits for the map server
-        resume=saved_discovery if saved_discovery.get("pending") is not None else None,
-    )
-    fraction_before = 1.0 if saved_discovery.get("complete") else float(saved_discovery.get("done") or 0.0)
-    for piece in pieces:
-        if piece.failed_tile is not None:
-            pieces_failed += 1
-            last_piece_error = piece.error
-            q.log_error(jobs, job_id, "discover", f"Area {piece.failed_tile.label()}: {piece.error}")
-        else:
-            pieces_ok += 1
+    cfg = osm_extracts.ExtractConfig.from_settings(settings)
+    cache = osm_extracts.ExtractCache(db, cfg, owner=f"{settings.worker_id}:{job_id}", client=client,
+                                      filter_fn=extract_filter, sleep=sleep)
+    pins: list[osm_extracts.Pinned] = []
+    try:
+        if saved.get("extracts") and not saved.get("complete"):
+            for info in saved["extracts"]:
+                pin = cache.pin_version(info, job_id=job_id)
+                if pin is None:  # that exact version is gone: restart the OSM stage with current data
+                    for p in pins:
+                        cache.unpin(p)
+                    pins = []
+                    q.log_error(jobs, job_id, "discover", "The OpenStreetMap data used before the restart was "
+                                "replaced; the map stage starts again (saved leads are kept, not duplicated).")
+                    saved = {}
+                    break
+                pins.append(pin)
+        if not saved.get("complete") and not pins:
+            progress(stage="Selecting OpenStreetMap extract", pct=7)
+            index = osm_extracts.GeofabrikIndex.load(client, cfg)
+            ready = [d["_id"] for d in db.osmExtracts.find({"status": "ready", "current": {"$ne": None}}, {"_id": 1})]
+            regions = index.plan(
+                area.geometry, cached=ready,
+                size_of=lambda r: osm_extracts.resolve_source(client, r).length,
+                max_download_bytes=cfg.max_download_bytes, max_job_download_bytes=cfg.max_job_download_bytes,
+                max_extracts=cfg.max_extracts_per_job)
+            pins = cache.ensure(regions, job_id=job_id, heartbeat=lambda: progress(),
+                                on_stage=lambda st: progress(stage=st))
+            saved = {"extracts": [p.as_checkpoint() for p in pins], "index": 0, "position": 0, "counters": counters()}
+            q.save_checkpoint(jobs, job_id, "osm", saved)
+        if pins:
+            jobs.update_one({"_id": job_id}, {"$set": {"location.osmExtract": {
+                "provider": "geofabrik", "license": "ODbL 1.0 (OpenStreetMap contributors)",
+                "extracts": [{k: v for k, v in p.as_checkpoint().items() if k != "file"} for p in pins]}}})
 
-        for i, element in enumerate(piece.elements, 1):
-            processed += 1
-            try:
-                point = element if "lat" in element else element.get("center") or {}
-                if "lat" in point and not area.contains(float(point["lat"]), float(point["lon"])):
-                    stats["outsideArea"] += 1  # inside the search box, but outside the chosen place
-                    continue
-                lead = mapping.element_to_lead(element, now=q.now(), area_country_code=area_cc)
-                if lead is None:
-                    continue
-                osm_id = lead["externalIds"]["osm"]
-                if osm_id in seen:  # a place on the border between two pieces comes back twice
-                    stats["duplicates"] += 1
-                    continue
-                seen.add(osm_id)
-                stats["discovered"] += 1
-                stats["withWebsite"] += "website" in lead
-                if suppression.is_suppressed(lead, hashes):
-                    stats["suppressed"] += 1
-                    continue
-                result = leads.upsert_lead(db.leads, owner_id=owner_id, job_id=job_id, lead=lead, now=q.now())
-                stats[{"new": "newLeads", "merged": "merged"}.get(result, "updated")] += 1
-            except Exception as exc:  # one bad element must not lose the rest of the results
-                element_failures += 1
-                q.log_error(jobs, job_id, "save", f"{type(exc).__name__}: {exc}", url=mapping.osm_url(element))
-            if processed % SAVE_PROGRESS_EVERY == 0:
-                _save_stats(jobs, job_id, stats)
-                # Move the bar while saving too, so a one-piece search doesn't sit at 10%.
-                saving = fraction_before + (piece.fraction_done - fraction_before) * i / len(piece.elements)
-                progress(pct=10 + DISCOVER_SHARE * saving, processed=processed, total=processed,
-                         stage=f"Saving businesses: {stats['discovered']} so far")
+        total = sum(p.features for p in pins) or 1
+        first = saved.get("index", 0)
+        done_before = sum(p.features for p in pins[:first]) + saved.get("position", 0)
+        last_renew = time.monotonic()
+        for k, pin in enumerate(pins):
+            if k < first:
+                continue
+            start = saved.get("position", 0) if k == first else 0
+            data_date = (pin.osm_timestamp or pin.version)[:10]
+            progress(stage=f"Processing gyms from {pin.name} (OpenStreetMap data of {data_date})",
+                     pct=10 + DISCOVER_SHARE * min(1.0, done_before / total))
+            for i, element in osm_extracts.read_elements(cache.abs(pin.file), start):
+                processed += 1
+                try:
+                    point = element if "lat" in element else element.get("center") or {}
+                    if "lat" in point and not area.contains(float(point["lat"]), float(point["lon"])):
+                        stats["outsideArea"] += 1  # in the extract, but outside the chosen place
+                        continue
+                    lead = mapping.element_to_lead(element, now=q.now(), area_country_code=area_cc)
+                    if lead is None:
+                        continue
+                    if wanted and not wanted & set(lead["categories"]):
+                        stats["otherCategory"] += 1  # e.g. a sports shop in a "boxing clubs" search
+                        continue
+                    osm_id = lead["externalIds"]["osm"]
+                    if osm_id in seen:  # overlapping extracts (neighbouring counties) hold the same element
+                        stats["duplicates"] += 1
+                        continue
+                    seen.add(osm_id)
+                    stats["discovered"] += 1
+                    stats["withWebsite"] += "website" in lead
+                    if suppression.is_suppressed(lead, hashes):
+                        stats["suppressed"] += 1
+                        continue
+                    result = leads.upsert_lead(db.leads, owner_id=owner_id, job_id=job_id, lead=lead, now=q.now())
+                    stats[{"new": "newLeads", "merged": "merged"}.get(result, "updated")] += 1
+                except Exception as exc:  # one bad element must not lose the rest of the results
+                    element_failures += 1
+                    q.log_error(jobs, job_id, "save", f"{type(exc).__name__}: {exc}", url=mapping.osm_url(element))
+                if processed % SAVE_PROGRESS_EVERY == 0:
+                    _save_stats(jobs, job_id, stats)
+                    # Everything up to element i is saved: a restart continues at i + 1 (same version).
+                    q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k, "position": i + 1, "counters": counters()})
+                    progress(pct=10 + DISCOVER_SHARE * min(1.0, (done_before + i - start + 1) / total),
+                             processed=processed, total=total, stage=f"Processing gyms: {stats['discovered']} found")
+                    if time.monotonic() - last_renew > 60:
+                        cache.renew(pins)  # long jobs keep their files pinned
+                        last_renew = time.monotonic()
+            done_before += pin.features - start
+            _save_stats(jobs, job_id, stats)
+            q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k + 1, "position": 0, "counters": counters()})
+        q.save_checkpoint(jobs, job_id, "osm", {**saved, "complete": True, "counters": counters()})
+    finally:
+        for p in pins:
+            cache.unpin(p)
+    _save_stats(jobs, job_id, stats)
+    progress(stage=f"OpenStreetMap: {stats['discovered']} gyms found", pct=10 + DISCOVER_SHARE)
 
-        fraction_before = piece.fraction_done
-        _save_stats(jobs, job_id, stats)
-        # This piece's leads are saved: remember it, so a crash or retry continues with the next piece.
-        q.save_checkpoint(jobs, job_id, "discovery", {**piece.state, "counters": counters_now()})
-        left = f", {piece.pending} parts of the area left" if piece.pending else ""
-        progress(
-            stage=f"Searching OpenStreetMap: {stats['discovered']} businesses found{left}",
-            pct=10 + DISCOVER_SHARE * piece.fraction_done,
-            processed=processed,
-            total=processed,
-        )
-
-    if not saved_discovery.get("complete"):
-        q.save_checkpoint(jobs, job_id, "discovery", {"complete": True, "counters": counters_now()})
-
-    google_active = google is not None and google.mode == "google+osm"
-    osm_failed = pieces_ok == 0 and pieces_failed > 0
-    if osm_failed and not google_active:
-        # Every piece failed: almost always the shared map server being down/overloaded. Retry later
-        # (the next attempt starts from scratch for OSM, because no piece finished).
-        q.save_checkpoint(jobs, job_id, "discovery", {})
-        raise TransientJobError(last_piece_error or "OpenStreetMap search failed. Try again later.")
     if processed and element_failures == processed:
         raise RuntimeError("None of the businesses could be saved. Check the worker logs.")
 
     # 3b. Merge what Google found (waits for the Google thread, with heartbeats).
     google_problem = False
     if google is not None and google.mode != "off":
-        progress(stage="Matching Google results with OpenStreetMap", pct=10 + DISCOVER_SHARE)
+        progress(stage="Recording Google Maps places (not linked to leads)", pct=10 + DISCOVER_SHARE)
         report = google.finish(bbox=place["bbox"], now=q.now(), heartbeat=lambda: progress())
         jobs.update_one({"_id": job_id}, {"$set": {"google": report}})
         if report.get("note") and report["mode"] == "osm-only" and google.mode == "google+osm":
@@ -296,12 +312,7 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
         "stats.withEmail": db.leads.count_documents({"ownerId": owner_id, "jobIds": job_id, "emails.0": {"$exists": True}}),
     }})
     progress(stage="Done", pct=100)
-    return "partial" if (element_failures or pieces_failed or cs.failed or google_problem) else "completed"
-
-
-def status_url(interpreter_url: str) -> str:
-    """https://overpass-api.de/api/interpreter -> https://overpass-api.de/api/status"""
-    return interpreter_url.rsplit("/", 1)[0] + "/status"
+    return "partial" if (element_failures or cs.failed or google_problem) else "completed"
 
 
 def _save_stats(jobs, job_id, stats: dict) -> None:

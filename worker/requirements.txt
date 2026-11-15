@@ -11,3 +11,5 @@ tzdata==2025.2
 # Phase 2a: offline search areas (Natural Earth shapefiles -> point-in-shape checks)
 shapely==2.2.0
 pyshp==3.1.8
+# Phase 2b: OpenStreetMap from Geofabrik extracts (stream-filter .osm.pbf files)
+osmium==4.3.2

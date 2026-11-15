@@ -9,6 +9,7 @@ from . import jobs as q
 from .config import load_settings
 from .db import connect
 from .google.merge import purge_expired_locations
+from .osm.extracts import BackgroundRefresher, ExtractConfig
 from .pipeline import JobCancelled, is_transient, run_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -62,6 +63,14 @@ def main() -> None:
     else:
         log.info("Google Places disabled (no GOOGLE_PLACES_API_KEY): jobs run OpenStreetMap-only")
 
+    # OpenStreetMap comes only from Geofabrik extracts (no public Overpass). Clean up after a crash,
+    # then refresh stale extracts in the background (MongoDB leases make this safe across processes).
+    extract_cfg = ExtractConfig.from_settings(settings)
+    refresher = BackgroundRefresher(db, extract_cfg, owner=f"{settings.worker_id}:refresher")
+    refresher.start()
+    log.info("OpenStreetMap cache budget %.1f GB on %s; temporary downloads in %s",
+             extract_cfg.cache_max_bytes / 1024**3, extract_cfg.cache_dir, extract_cfg.tmp_dir)
+
     last_recovery = 0.0
     try:
         while not _stop:
@@ -79,6 +88,7 @@ def main() -> None:
             else:
                 time.sleep(settings.poll_interval)
     finally:
+        refresher.stop()  # stops a running background download at its next heartbeat
         client.close()
         log.info("Worker stopped")
 

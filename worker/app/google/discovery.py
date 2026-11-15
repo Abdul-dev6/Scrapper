@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 from pymongo.database import Database
 
-from ..osm.discovery import Tile, initial_tiles
+from ..geo.tiles import Tile, initial_tiles
 from .places import MAX_PAGES, PAGE_SIZE, GoogleFatal, GoogleTransient, PlacesClient, QuotaExhausted
 
 # One plain query per category. Several categories can share one query.

@@ -23,7 +23,8 @@ Flow: user enters a location + categories → worker discovers businesses
 
 - Multi-user with open sign-up (/signup, max 5 accounts per IP per hour; decided 2026-11-09).
   Every document has `ownerId` and every query filters by it, so users never see each other's data.
-- Discovery v1: Nominatim (geocode, max 1 req/sec, cache results) + Overpass.
+- Discovery: offline gazetteer + Natural Earth areas (Phase 2a) and Geofabrik extracts (Phase 2b).
+  No public Nominatim and no public Overpass in production (decided 2026-11-14/15).
 - Google Places (decided 2026-11-13, revised 2026-11-14): optional, OFF by default, worker-only key
   (GOOGLE_PLACES_API_KEY). Text Search Pro field mask only (never Enterprise fields). Google results
   are NEVER matched or linked to any lead; only place IDs are stored (`googlePlaceRefs`), and nothing
@@ -82,5 +83,8 @@ a new concept. Explain WHY a solution works, not only what changed.
    job checkpoints/resume, exponential backoff, crawler retry, Google off + no matching/export.
    Next: Phase 2 (GeoNames/Natural Earth geocoder, Geofabrik extracts), Phase 3 (Overture, non-OSM lane),
    then the Great Britain pilot. Each phase needs approval.
-8. 🟡 Phase 2a (branch phase-2-geocoder-extracts): offline place search (GeoNames gazetteer) + Natural Earth
-   search areas; Nominatim removed. Phase 2b next: Geofabrik extracts replace public Overpass.
+8. ✅ Phase 2a (branch phase-2-geocoder-extracts): offline place search (GeoNames gazetteer) + Natural Earth
+   search areas; Nominatim removed.
+9. ✅ Phase 2b (same branch): Geofabrik extracts replace public Overpass completely (no fallback). Filtered
+   gym files on the Railway Volume (/data/osm), metadata in `osmExtracts`; leases, pins, LRU eviction,
+   stale-while-refresh. pyosmium only loads in the Docker image (Windows App Control blocks it locally).

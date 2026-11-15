@@ -8,7 +8,11 @@ import { CATEGORIES } from "@/lib/categories";
 type Status = "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
 type Job = {
   _id: string;
-  location: { query: string; displayName?: string };
+  location: {
+    query: string;
+    displayName?: string;
+    osmExtract?: { provider: string; extracts: { name: string; version: string; osmTimestamp?: string | null; features?: number }[] };
+  };
   categories: string[];
   sources?: string[];
   status: Status;
@@ -320,9 +324,19 @@ function JobDetails({ job }: { job: Job }) {
       ]
     : [];
 
+  const osm = job.location.osmExtract;
   return (
     <div className="space-y-4">
       {STATUS_HELP[job.status] && <p className="text-sm">{STATUS_HELP[job.status]}</p>}
+      {osm?.extracts?.length ? (
+        <p className="text-sm text-muted">
+          OpenStreetMap data (Geofabrik extract{osm.extracts.length > 1 ? "s" : ""}):{" "}
+          {osm.extracts
+            .map((e) => `${e.name}, data of ${(e.osmTimestamp || e.version).slice(0, 10)}`)
+            .join(" · ")}
+          {" "}· © OpenStreetMap contributors (ODbL)
+        </p>
+      ) : null}
       {g && g.mode !== "off" && (
         <div className="space-y-2">
           <h3 className="text-sm font-semibold">Google Places · {MODE_LABEL[g.mode] ?? g.mode}</h3>

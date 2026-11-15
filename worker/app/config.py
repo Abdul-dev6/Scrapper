@@ -18,9 +18,16 @@ class Settings:
     stale_after: int
     max_attempts: int
     crawler_contact_url: str
-    overpass_url: str = "https://overpass-api.de/api/interpreter"
-    overpass_timeout: int = 90  # seconds the server may spend on one piece before we split it
-    max_discovery_queries: int = 2000  # safety cap per job; a big country needs far fewer
+    # Phase 2b: OpenStreetMap from Geofabrik extracts (public Overpass is not used at all).
+    osm_cache_dir: str = "/data/osm"  # persistent Railway Volume: filtered gym files + cached index
+    osm_tmp_dir: str = ""  # container disk for original downloads ("" = <system temp>/leadfinder-osm)
+    osm_cache_max_bytes: int = 4 * 1024**3  # budget for filtered files (Railway Hobby volume max 5 GB)
+    osm_volume_margin_bytes: int = 256 * 1024**2  # always leave this much free on the volume
+    osm_tmp_margin_bytes: int = 1024**3  # ...and on the temporary disk
+    osm_refresh_days: float = 7
+    osm_max_download_bytes: int = 6 * 1024**3  # one extract
+    osm_max_job_download_bytes: int = 8 * 1024**3  # everything one job may download
+    geofabrik_index_url: str = "https://download.geofabrik.de/index-v1.json"
     crawl_concurrency: int = 10  # websites crawled at the same time (each site still gets 1 request / delay)
     crawl_delay: float = 2.5  # seconds between two requests to the same website
     crawl_max_pages: int = 5  # pages per website: home + up to 4 contact/about pages
@@ -62,9 +69,15 @@ def load_settings() -> Settings:
         stale_after=int(os.getenv("STALE_AFTER_SECONDS", "600")),
         max_attempts=int(os.getenv("MAX_ATTEMPTS", "3")),
         crawler_contact_url=os.getenv("CRAWLER_CONTACT_URL", "").strip(),
-        overpass_url=os.getenv("OVERPASS_URL", d.overpass_url),
-        overpass_timeout=num("OVERPASS_TIMEOUT_SECONDS", d.overpass_timeout),
-        max_discovery_queries=num("MAX_DISCOVERY_QUERIES", d.max_discovery_queries),
+        osm_cache_dir=os.getenv("OSM_CACHE_DIR", d.osm_cache_dir),
+        osm_tmp_dir=os.getenv("OSM_TMP_DIR", d.osm_tmp_dir),
+        osm_cache_max_bytes=num("OSM_CACHE_MAX_BYTES", d.osm_cache_max_bytes),
+        osm_volume_margin_bytes=num("OSM_VOLUME_MARGIN_BYTES", d.osm_volume_margin_bytes),
+        osm_tmp_margin_bytes=num("OSM_TMP_MARGIN_BYTES", d.osm_tmp_margin_bytes),
+        osm_refresh_days=num("OSM_REFRESH_DAYS", d.osm_refresh_days, float),
+        osm_max_download_bytes=num("OSM_MAX_DOWNLOAD_BYTES", d.osm_max_download_bytes),
+        osm_max_job_download_bytes=num("OSM_MAX_JOB_DOWNLOAD_BYTES", d.osm_max_job_download_bytes),
+        geofabrik_index_url=os.getenv("GEOFABRIK_INDEX_URL", d.geofabrik_index_url),
         crawl_concurrency=num("CRAWL_CONCURRENCY", d.crawl_concurrency),
         crawl_delay=max(2.0, num("CRAWL_DELAY_SECONDS", d.crawl_delay, float)),  # never ruder than 2 s
         crawl_max_pages=min(5, num("CRAWL_MAX_PAGES", d.crawl_max_pages)),  # rule: max 5

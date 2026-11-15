@@ -16,6 +16,9 @@ const jobSchema = new Schema(
       // boundary data the worker used to build the search area (source, id, version).
       place: { type: Schema.Types.Mixed, default: undefined },
       boundary: { type: Schema.Types.Mixed, default: undefined },
+      // Phase 2b: the exact OpenStreetMap extract versions this job read (provider, region, version,
+      // sha256, data date). Written by the worker; shown in job details.
+      osmExtract: { type: Schema.Types.Mixed, default: undefined },
     },
     categories: [{ type: String, enum: CATEGORY_IDS, required: true }],
     sources: [{ type: String, enum: SOURCES, required: true }],

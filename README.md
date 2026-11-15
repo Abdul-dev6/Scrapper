@@ -48,7 +48,7 @@ A city takes about a minute; a whole country takes minutes, and its New count gr
 Only continents are rejected.
 Run the same search again: "New" is 0, because existing leads are updated, not duplicated.
 
-How discovery works (Step 2):
+How discovery worked in Step 2 (historical; replaced by Phase 2a/2b below: no Nominatim, no Overpass):
 1. Nominatim turns the location text into an area (max 1 request/second, cached 30 days in `geocodeCache`).
 2. Overpass searches that area for named places in the selected categories. If an area is too heavy
    for the free server, it is split into 4 and each quarter is searched (only crowded parts get split).
@@ -142,6 +142,22 @@ Place search and search areas (Phase 2a, 2026-11-14). No public Nominatim:
   version + sha256 (`app/geo/data.py`): countries, regions, urban outlines, else a radius by population, always
   clipped to the country. Places outside the area are dropped. The job records the boundary source and version.
 - Searches created before this change can't be retried (they have no picked place): start a new search.
+
+OpenStreetMap from Geofabrik extracts (Phase 2b, 2026-11-15). Public Overpass is not used at all:
+- For each search the worker picks the Geofabrik extracts covering the area by their REAL download size
+  (London: Greater London + 6 neighbouring counties, 0.34 GB, not all of England; UK: one 2.1 GB file).
+  Too-large areas (e.g. the whole USA, 11 GB) fail with "search a smaller area".
+- The original `.osm.pbf` goes to temporary container disk, is checked (size + Geofabrik's MD5), filtered with
+  pyosmium to named gyms (same category rules as before, Overpass-style centre points), and deleted.
+  Only the small filtered file is kept, on the Railway Volume (`OSM_CACHE_DIR=/data/osm`), as an immutable,
+  checksummed file. MongoDB `osmExtracts` holds metadata only (version, sha256, paths, leases, errors).
+- Fresh (< 7 days): used at once. Stale: used at once AND refreshed in the background. Missing: downloaded first.
+  A failed refresh never touches the last good file. Two searches for the same area download it once
+  (MongoDB lease); a job pins the exact file version it reads, and eviction (LRU, 4 GB budget) never deletes
+  a pinned, refreshing or last-valid file. Downloads resume safely (HTTP Range + ETag) after interruptions.
+- Railway: add a Volume to the worker service mounted at `/data` (Hobby: max 5 GB). Free space is checked at
+  runtime before every download and write. Run `npm run db:indexes` once (adds `osmExtracts`).
+- Pilot/measurement: `worker/scripts/pilot_extract.py` (see its docstring; never writes to MongoDB Atlas).
 
 ## Build steps
 1. ✅ Setup, models + indexes, auth, job queue

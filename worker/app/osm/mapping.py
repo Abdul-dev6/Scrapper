@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import tldextract
 
 from .. import contacts
-from .overpass import match_categories
+from .tags import match_categories
 
 # Offline: uses the public-suffix snapshot bundled with tldextract, never downloads.
 _tld = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)

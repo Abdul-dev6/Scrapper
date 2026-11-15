@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import httpx
 import pytest
 
@@ -50,7 +52,13 @@ def test_end_to_end_saves_leads_with_sources(db, settings, no_wait_limiter):
 
     ua = fake.calls[0].headers["user-agent"]
     assert settings.crawler_contact_url in ua
-    assert "(51.28,-0.51,51.69,0.33)" in fake.queries()[0]  # searched the chosen place's area (offline boundary)
+    # OpenStreetMap came from one Geofabrik extract (downloaded once), recorded with its exact version.
+    assert len(fake.downloads()) == 1
+    ext = job["location"]["osmExtract"]
+    assert ext["provider"] == "geofabrik" and ext["extracts"][0]["regionId"] == "great-britain"
+    assert ext["extracts"][0]["version"] == "great-britain-261113" and len(ext["extracts"][0]["sha256"]) == 64
+    assert "ODbL" in ext["license"]
+    assert all(r.url.host == "geofabrik.test" for r in fake.calls)  # no other map service, no Overpass
     assert job["location"]["displayName"] == "London, England, United Kingdom"
     assert job["location"]["boundary"]["source"] == "naturalearth-urban-area"
     assert job["location"]["boundary"]["version"] == "test-urban"  # exact boundary version recorded
@@ -64,7 +72,17 @@ def test_rerun_updates_instead_of_duplicating_and_keeps_user_fields(db, settings
         "value": "coach@ironfist.co.uk", "kind": "named", "sourceUrl": "https://ironfist.co.uk/contact", "sourceType": "website"}}})
 
     changed = [boxing(1, "Iron Fist Boxing", website="https://ironfist.co.uk", email="hello@ironfist.co.uk"), *ELEMENTS[1:]]
-    job_id, status, job = claim_and_run(db, settings, FakeOSM(elements=changed), no_wait_limiter)
+    # A week later Geofabrik has a new extract with the changes. The cached file is now stale: it is
+    # still used immediately, and a refresh runs in the background (stale-while-refresh).
+    fake = FakeOSM(elements=changed)
+    fake.set_version("great-britain", "great-britain-261120")
+    db.osmExtracts.update_one({"_id": "great-britain"}, {"$set": {"current.refreshedAt": q.now() - timedelta(days=8)}})
+    _, _, stale_job = claim_and_run(db, settings, fake, no_wait_limiter)
+    assert stale_job["location"]["osmExtract"]["extracts"][0]["version"] == "great-britain-261113"  # old data, no wait
+    assert db.osmExtracts.find_one({"_id": "great-britain"})["refreshRequestedAt"] is not None
+    _run_background_refresh(db, settings, fake)
+    assert db.osmExtracts.find_one({"_id": "great-britain"})["current"]["version"] == "great-britain-261120"
+    job_id, status, job = claim_and_run(db, settings, fake, no_wait_limiter)
 
     assert status == "completed"
     assert job["stats"]["newLeads"] == 0 and job["stats"]["updated"] == 4
@@ -73,7 +91,7 @@ def test_rerun_updates_instead_of_duplicating_and_keeps_user_fields(db, settings
     assert iron["name"] == "Iron Fist Boxing"
     assert (iron["saved"], iron["notes"], iron["status"]) == (True, "Call Monday", "contacted")
     assert {e["value"] for e in iron["emails"]} == {"coach@ironfist.co.uk", "hello@ironfist.co.uk"}  # old OSM email replaced
-    assert len(iron["jobIds"]) == 2 and iron["jobIds"][1] == job_id
+    assert len(iron["jobIds"]) == 3 and iron["jobIds"][2] == job_id
 
 
 def test_no_external_geocoding_and_places_outside_the_area_are_dropped(db, settings, no_wait_limiter):
@@ -129,7 +147,7 @@ def test_cancel_during_job_stops_it(db, settings, no_wait_limiter):
 
 
 def test_one_bad_element_makes_job_partial(db, settings, no_wait_limiter):
-    broken = {"type": "node", "tags": {"name": "No id"}}  # missing "id" -> KeyError while mapping
+    broken = {"type": "node", "lat": 51.5, "lon": -0.1, "tags": {"name": "No id", "sport": "boxing"}}  # no "id" -> KeyError
     _, status, job = claim_and_run(db, settings, FakeOSM(elements=[*ELEMENTS, broken]), no_wait_limiter)
     assert status == "partial"
     assert job["stats"]["newLeads"] == 4 and job["stats"]["errors"] == 1
@@ -163,7 +181,7 @@ def test_no_results_is_a_completed_job(db, settings, no_wait_limiter):
 def test_friendly_failure_reaches_the_job(db, settings, no_wait_limiter, monkeypatch):
     from app import pipeline
 
-    fake = FakeOSM(overpass_status=503)  # always busy
+    fake = FakeOSM(status=503)  # Geofabrik is down
     real_make_client = pipeline.make_client
     monkeypatch.setattr(pipeline, "make_client", lambda s: real_make_client(s, transport=httpx.MockTransport(fake.handler)))
     monkeypatch.setattr(pipeline, "NOMINATIM_LIMITER", no_wait_limiter)
@@ -172,9 +190,10 @@ def test_friendly_failure_reaches_the_job(db, settings, no_wait_limiter, monkeyp
     job = q.claim_next_job(db.scrapingJobs, "w1")
     process(db, job, settings)
     saved = db.scrapingJobs.find_one({"_id": job["_id"]})
-    # A busy map server is temporary: the job waits and retries (it used to fail at once).
+    # Geofabrik being down is temporary: the job waits and retries with backoff. No fallback service.
     assert saved["status"] == "queued" and saved["nextAttemptAt"] > q.now()
-    assert "busy" in saved["progress"]["stage"] and "retrying" in saved["progress"]["stage"]
+    assert "HTTP 503" in saved["progress"]["stage"] and "retrying" in saved["progress"]["stage"]
+    assert all(r.url.host == "geofabrik.test" for r in fake.calls)
 
     # Still busy on the last allowed attempt: now it fails, with the friendly message.
     db.scrapingJobs.update_one({"_id": job["_id"]}, {"$set": {"nextAttemptAt": q.now(), "attempts": settings.max_attempts - 1}})
@@ -182,7 +201,7 @@ def test_friendly_failure_reaches_the_job(db, settings, no_wait_limiter, monkeyp
     process(db, job, settings)
     saved = db.scrapingJobs.find_one({"_id": job["_id"]})
     assert saved["status"] == "failed"
-    assert "busy" in saved["progress"]["stage"]
+    assert "HTTP 503" in saved["progress"]["stage"]  # a clear reason, not a generic error
 
 
 def test_missing_contact_url_fails_before_any_request(db, settings, no_wait_limiter):
@@ -196,33 +215,76 @@ def test_missing_contact_url_fails_before_any_request(db, settings, no_wait_limi
     assert fake.calls == []
 
 
-def test_cancel_is_noticed_while_waiting_for_a_busy_map_server(db, settings, no_wait_limiter):
+def test_cancel_is_noticed_while_waiting_for_another_worker_to_prepare_the_extract(db, settings, no_wait_limiter):
+    """Another worker holds the refresh lease (it is downloading the same extract): this job waits
+    for it, with heartbeats, and notices Cancel during that wait."""
+    db.osmExtracts.insert_one({"_id": "great-britain", "status": "missing", "readers": [],
+                               "refreshLease": {"owner": "other-worker", "until": q.now() + timedelta(hours=1)}})
     add_job(db)
     job = q.claim_next_job(db.scrapingJobs, "w1")
     waits = []
 
-    def sleep(seconds):  # the user presses Cancel during the first "server busy" pause
+    def sleep(seconds):  # the user presses Cancel during the first wait
         waits.append(seconds)
         db.scrapingJobs.update_one({"_id": job["_id"]}, {"$set": {"cancelRequested": True}})
 
-    fake = FakeOSM(overpass_status=503)
+    fake = FakeOSM(elements=ELEMENTS)
     with pytest.raises(JobCancelled):
         run_job(db, job, settings, client=fake.client(settings), sleep=sleep, limiter=no_wait_limiter,
                 web_transport=FakeWeb().transport(), mx_resolve=FakeWeb().resolve)
-    assert len(waits) == 1 and fake.count("overpass.test") == 1  # stopped right away, no more retries
+    assert len(waits) == 1 and fake.downloads() == []  # never downloaded it a second time
 
 
 def test_heartbeat_keeps_a_long_wait_alive(db, settings, no_wait_limiter):
+    """While waiting for another worker's download, lockedAt keeps moving (the job isn't 'stale')."""
+    db.osmExtracts.insert_one({"_id": "great-britain", "status": "missing", "readers": [],
+                               "refreshLease": {"owner": "other-worker", "until": q.now() + timedelta(hours=1)}})
     add_job(db)
     job = q.claim_next_job(db.scrapingJobs, "w1")
     old = q.now().replace(year=2020)
     beats = []
 
-    def sleep(_seconds):  # pretend a lot of time passed; the next heartbeat must refresh lockedAt
+    def sleep(_seconds):  # time passes; then the other worker's lease expires (it crashed)
         db.scrapingJobs.update_one({"_id": job["_id"]}, {"$set": {"lockedAt": old}})
         beats.append(1)
+        if len(beats) == 2:
+            db.osmExtracts.update_one({"_id": "great-britain"},
+                                      {"$set": {"refreshLease.until": q.now() - timedelta(seconds=1)}})
 
-    fake = FakeOSM(overpass_responses=[httpx.Response(503)], elements=[])
-    run_job(db, job, settings, client=fake.client(settings), sleep=sleep, limiter=no_wait_limiter,
-            web_transport=FakeWeb().transport(), mx_resolve=FakeWeb().resolve)
-    assert beats and db.scrapingJobs.find_one({"_id": job["_id"]})["lockedAt"] > old
+    fake = FakeOSM(elements=ELEMENTS)
+    status = run_job(db, job, settings, client=fake.client(settings), sleep=sleep, limiter=no_wait_limiter,
+                     web_transport=FakeWeb().transport(), mx_resolve=FakeWeb().resolve)
+    assert status == "completed" and len(beats) >= 2
+    assert db.scrapingJobs.find_one({"_id": job["_id"]})["lockedAt"] > old
+    assert len(fake.downloads()) == 1  # took over the crashed worker's expired lease and built it once
+
+
+def _run_background_refresh(db, settings, fake):
+    """What the worker's background refresh thread does (one pass)."""
+    from app.osm import extracts
+
+    cfg = extracts.ExtractConfig.from_settings(settings)
+    client = fake.client(settings)
+    cache = extracts.ExtractCache(db, cfg, owner="refresher", client=client)
+    return cache.refresh_requested(extracts.GeofabrikIndex.load(client, cfg))
+
+
+def test_only_the_selected_categories_are_saved_from_the_shared_extract(db, settings, no_wait_limiter):
+    """The cached extract holds every category; a 'boxing clubs' search must not save gyms or shops
+    (exactly what the old Overpass query, which only asked for the selected categories, did)."""
+    mixed = [
+        boxing(1, "Iron Fist"),
+        {"type": "node", "id": 2, "lat": 51.5, "lon": -0.1, "tags": {"name": "PureGym", "leisure": "fitness_centre"}},
+        {"type": "node", "id": 3, "lat": 51.5, "lon": -0.1, "tags": {"name": "Sports Direct", "shop": "sports"}},
+        {"type": "node", "id": 4, "lat": 51.5, "lon": -0.1,
+         "tags": {"name": "Box & Fit", "leisure": "fitness_centre", "sport": "boxing;fitness"}},  # both: kept
+    ]
+    _, status, job = claim_and_run(db, settings, FakeOSM(elements=mixed), no_wait_limiter, categories=["boxing_club"])
+    assert status == "completed"
+    assert {d["externalIds"]["osm"] for d in db.leads.find()} == {"node/1", "node/4"}
+    assert job["stats"]["otherCategory"] == 2
+    # The same cached file serves a 'gyms' search with the other places, without a new download.
+    fake = FakeOSM(elements=mixed)
+    _, _, job2 = claim_and_run(db, settings, fake, no_wait_limiter, categories=["gym"])
+    assert {d["externalIds"]["osm"] for d in db.leads.find({"jobIds": job2["_id"]})} == {"node/2", "node/4"}
+    assert fake.downloads() == []

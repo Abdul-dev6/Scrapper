@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
@@ -10,7 +11,6 @@ from app import jobs as q
 from app.config import Settings
 from app.osm.ratelimit import RateLimiter
 
-OVERPASS = "https://overpass.test/api/interpreter"
 OWNER = ObjectId()
 
 
@@ -97,12 +97,13 @@ def db():
 
 
 @pytest.fixture
-def settings():
+def settings(tmp_path):
     return Settings(
         mongodb_uri="mongodb://test", mongodb_db="test", worker_id="w-test", poll_interval=0,
         stale_after=600, max_attempts=3, crawler_contact_url="https://lead-finder.test/crawler",
-        overpass_url=OVERPASS, overpass_timeout=60, max_discovery_queries=200,
         crawl_concurrency=5, crawl_delay=0, crawl_max_pages=5, crawl_timeout=5, crawl_recheck_days=7,
+        osm_cache_dir=str(tmp_path / "volume" / "osm"), osm_tmp_dir=str(tmp_path / "tmp"),
+        osm_volume_margin_bytes=0, osm_tmp_margin_bytes=0, geofabrik_index_url=GEOFABRIK_INDEX,
     )
 
 
@@ -128,46 +129,133 @@ def add_job(db, **over):
     return db.scrapingJobs.insert_one(doc).inserted_id
 
 
-LONDON = {
-    "osm_type": "relation", "osm_id": 65606, "addresstype": "city",
-    "display_name": "London, Greater London, England, United Kingdom",
-    "boundingbox": ["51.28", "51.69", "-0.51", "0.33"],
-    "address": {"city": "London", "country": "United Kingdom", "country_code": "gb"},
-}
+GEOFABRIK = "https://geofabrik.test"
+GEOFABRIK_INDEX = f"{GEOFABRIK}/index-v1.json"
+TEST_REGION_BOX = [49.9, -8.0, 60.9, 1.8]  # [south, west, north, east]: the test "great-britain" region
+
+
+def _box_geojson(s, w, n, e):
+    return {"type": "Polygon", "coordinates": [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}
+
+
+def fake_filter(pbf_path, heartbeat):
+    """Stands in for pyosmium in local tests: the fake "PBF" is the element list as JSON.
+    Applies the same rule as the real filter (named + matching a category). The real pyosmium
+    filter is tested against generated PBF files in tests/test_extracts_osmium.py (Docker)."""
+    from app.osm.tags import is_wanted
+
+    from app.osm.extracts import ExtractCorrupt
+
+    try:
+        data = json.loads(Path(pbf_path).read_bytes() or b"null")
+    except ValueError:
+        data = None
+    if not isinstance(data, list):  # like libosmium refusing a file that isn't a PBF
+        raise ExtractCorrupt("The map data file can't be read (test: not a valid extract).")
+    for el in data:
+        heartbeat()
+        if is_wanted(el.get("tags") or {}):
+            yield el
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_osmium: needs pyosmium (runs in the production Docker image)")
+
+
+@pytest.fixture(autouse=True)
+def fake_pbf_filter(request, monkeypatch):
+    """Local tests use fake_filter; tests marked `real_osmium` use pyosmium itself (Docker)."""
+    if request.node.get_closest_marker("real_osmium"):
+        return
+    from app.osm import extracts
+
+    monkeypatch.setattr(extracts, "filter_pbf_osmium", fake_filter)
 
 
 class FakeOSM:
-    """httpx MockTransport that plays Nominatim and Overpass, and records calls.
+    """httpx MockTransport that plays Geofabrik (the only OpenStreetMap source), and records calls.
 
-    overpass_responses: queue of responses for the first queries, then `elements`.
-    overpass_status:    if set, every query gets this HTTP status (e.g. 503 = always busy).
-    overpass_fn:        if set, called with the query text; returns an httpx.Response.
-    status_text:        what /api/status says (default: a free slot).
+    elements:      the OSM elements (Overpass-compatible dicts) inside the test extract
+    regions:       {id: (box, version)}; default one "great-britain" region covering TEST_REGION_BOX
+    status:        if set, every extract request gets this HTTP status (e.g. 503 = Geofabrik down)
+    md5:           publish <file>.md5 (Geofabrik does); False = 404
+    ranges:        honour Range requests (Accept-Ranges: bytes)
+    cut_after:     simulate a dropped connection after this many body bytes (once, then normal)
+    wrong_length:  announce a Content-Length different from the body
     """
 
-    def __init__(self, places=None, elements=None, overpass_responses=None, overpass_status=None,
-                 overpass_fn=None, status_text="Rate limit: 2\n2 slots available now.\n"):
-        self.places = [LONDON] if places is None else places
+    def __init__(self, elements=None, regions=None, status=None, md5=True, ranges=True, cut_after=None,
+                 wrong_length=False, index_status=None, bodies=None, bad_md5=False):
         self.elements = elements or []
-        self.overpass_responses = list(overpass_responses or [])
-        self.overpass_status = overpass_status
-        self.overpass_fn = overpass_fn
-        self.status_text = status_text
+        self.regions = regions or {"great-britain": (TEST_REGION_BOX, "great-britain-261113")}
+        self.status = status
+        self.index_status = index_status
+        self.md5 = md5
+        self.ranges = ranges
+        self.cut_after = cut_after
+        self.wrong_length = wrong_length
+        self.bodies = bodies or {}  # region id -> raw bytes (default: json of elements)
+        self.bad_md5 = bad_md5  # publish a checksum that doesn't match (corrupted download)
         self.calls: list[httpx.Request] = []
 
+    # --- what Geofabrik serves
+    def index(self) -> dict:
+        feats = []
+        for rid, (box, _v) in self.regions.items():
+            feats.append({"type": "Feature", "geometry": _box_geojson(*box), "properties": {
+                "id": rid, "name": rid.replace("-", " ").title(), "parent": "europe",
+                "urls": {"pbf": f"{GEOFABRIK}/europe/{rid}-latest.osm.pbf", "updates": f"{GEOFABRIK}/europe/{rid}-updates"}}})
+        return {"type": "FeatureCollection", "features": feats}
+
+    def body(self, rid: str) -> bytes:
+        return self.bodies.get(rid, json.dumps(self.elements).encode())
+
+    def set_version(self, rid: str, version: str) -> None:
+        box, _ = self.regions[rid]
+        self.regions[rid] = (box, version)
+
     def handler(self, request: httpx.Request) -> httpx.Response:
+        import hashlib
+
         self.calls.append(request)
-        if request.url.host == "nominatim.test":
-            return httpx.Response(200, json=self.places)
-        if request.url.path.endswith("/status"):
-            return httpx.Response(200, text=self.status_text)
-        if self.overpass_status:
-            return httpx.Response(self.overpass_status)
-        if self.overpass_fn:
-            return self.overpass_fn(parse_qs(request.content.decode())["data"][0])
-        if self.overpass_responses:
-            return self.overpass_responses.pop(0)
-        return httpx.Response(200, content=json.dumps({"elements": self.elements}))
+        path = request.url.path
+        if request.url.host != "geofabrik.test":
+            return httpx.Response(599, text="unexpected host")
+        if path == "/index-v1.json":
+            if self.index_status:
+                return httpx.Response(self.index_status)
+            return httpx.Response(200, json=self.index())
+        if path.endswith("/state.txt"):
+            return httpx.Response(200, text="sequenceNumber=4963\ntimestamp=2026-11-13T21\\:22\\:20Z\n")
+        if self.status:
+            return httpx.Response(self.status)
+        for rid, (_box, version) in self.regions.items():
+            if path == f"/europe/{rid}-latest.osm.pbf":
+                return httpx.Response(307, headers={"location": f"/europe/{version}.osm.pbf"})
+            if path == f"/europe/{version}.osm.pbf.md5":
+                if not self.md5:
+                    return httpx.Response(404)
+                digest = "0" * 32 if self.bad_md5 else hashlib.md5(self.body(rid)).hexdigest()
+                return httpx.Response(200, text=f"{digest}  {version}.osm.pbf\n")
+            if path == f"/europe/{version}.osm.pbf":
+                data = self.body(rid)
+                headers = {"etag": f'"{version}"', "content-length": str(len(data) + (7 if self.wrong_length else 0))}
+                if self.ranges:
+                    headers["accept-ranges"] = "bytes"
+                if request.method == "HEAD":
+                    return httpx.Response(200, headers=headers)
+                rng = request.headers.get("range")
+                if rng and self.ranges and request.headers.get("if-range") == f'"{version}"':
+                    first = int(rng.split("=")[1].split("-")[0])
+                    part = data[first:]
+                    return httpx.Response(206, content=part, headers={**headers, "content-length": str(len(part)),
+                                          "content-range": f"bytes {first}-{len(data) - 1}/{len(data)}"})
+                if self.cut_after is not None:
+                    cut, self.cut_after = self.cut_after, None
+                    return httpx.Response(200, headers={**headers, "content-length": str(len(data))},
+                                          stream=_DroppingStream(data[:cut]))
+                return httpx.Response(200, content=data, headers=headers)
+        return httpx.Response(404)
 
     def client(self, settings=None) -> httpx.Client:
         """With settings: the worker's real client (headers, timeouts), just without network."""
@@ -178,15 +266,24 @@ class FakeOSM:
             return make_client(settings, transport=transport)
         return httpx.Client(transport=transport)
 
-    def queries(self) -> list[str]:
-        """Text of every Overpass query sent (status checks excluded)."""
-        return [parse_qs(r.content.decode())["data"][0] for r in self.calls
-                if r.url.host == "overpass.test" and r.url.path.endswith("/interpreter")]
+    def downloads(self) -> list[httpx.Request]:
+        """Every GET of an actual extract file (not index / md5 / state)."""
+        return [r for r in self.calls if r.method == "GET" and r.url.path.endswith(".osm.pbf")
+                and not r.url.path.endswith("-latest.osm.pbf")]
 
     def count(self, host: str) -> int:
-        if host == "overpass.test":
-            return len(self.queries())
         return sum(1 for r in self.calls if r.url.host == host)
+
+
+class _DroppingStream(httpx.SyncByteStream):
+    """Sends part of the body, then breaks the connection (like a network drop mid-download)."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+
+    def __iter__(self):
+        yield self.data
+        raise httpx.ReadError("connection reset by peer")
 
 
 class FakeWeb:

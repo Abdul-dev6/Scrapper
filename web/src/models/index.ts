@@ -6,3 +6,4 @@ export { Suppression } from "./Suppression";
 export { GeocodeCache } from "./GeocodeCache";
 export { ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage } from "./GoogleUsage";
 export { Gazetteer, GazetteerMeta } from "./Gazetteer";
+export { OsmExtract } from "./OsmExtract";

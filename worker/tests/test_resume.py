@@ -1,8 +1,6 @@
 """Checkpoints, resumable jobs, exponential backoff and the crawler's single retry."""
 
 import asyncio
-import json
-import re
 from datetime import timedelta
 
 import httpx
@@ -15,7 +13,7 @@ from app.crawl.robots import Robots
 from app.crawl.runner import make_async_client
 from app.main import process
 from app.geo.boundaries import AreaError
-from app.osm.overpass import OverpassBusy
+from app.osm.extracts import ExtractTooLarge, ExtractUnavailable
 from app.pipeline import run_job
 from tests.conftest import FakeOSM, FakeWeb, add_job
 
@@ -57,7 +55,8 @@ def test_stale_job_is_requeued_with_backoff_and_keeps_its_checkpoint(db):
 
 
 @pytest.mark.parametrize("error,status", [
-    (OverpassBusy("The OpenStreetMap search service is busy."), "queued"),  # temporary: retry later
+    (ExtractUnavailable("Geofabrik answered HTTP 503."), "queued"),  # temporary: retry later
+    (ExtractTooLarge("This area is too large to search."), "failed"),  # permanent: needs a smaller area
     (httpx.ConnectError("network down"), "queued"),
     (AreaError("No boundary is available for Atlantis."), "failed"),  # permanent: retrying won't help
     (RuntimeError("bug"), "failed"),
@@ -73,75 +72,140 @@ def test_temporary_errors_retry_permanent_errors_fail(db, monkeypatch, error, st
     assert db.scrapingJobs.find_one({"_id": job["_id"]})["status"] == status
 
 
-# ---------------------------------------------------------------- resume after a crash
+# ---------------------------------------------------------------- resume after a crash (extract checkpoints)
 
 
 class Crash(BaseException):
     """Simulates the worker process dying (not an Exception, so nothing in the job catches it)."""
 
 
-def _quarter_elements(query: str) -> httpx.Response:
-    """The whole London box is "too heavy" (504); each quarter returns one gym inside it."""
-    south, west, north, east = (float(x) for x in re.search(r"\(([-\d.]+),([-\d.]+),([-\d.]+),([-\d.]+)\);", query).groups())
-    if north - south > 0.3:
-        return httpx.Response(504)
-    lat, lon = (south + north) / 2, (west + east) / 2
-    el = {"type": "node", "id": int(abs(lat * 1000) + abs(lon * 1000) * 7), "lat": lat, "lon": lon,
-          "tags": {"name": f"Gym {lat:.3f} {lon:.3f}", "sport": "boxing"}}
-    return httpx.Response(200, content=json.dumps({"elements": [el]}))
+GYMS = [{"type": "node", "id": i, "lat": 51.5, "lon": -0.1, "tags": {"name": f"Gym {i}", "sport": "boxing"}}
+        for i in range(1, 61)]
 
 
-def test_crashed_job_resumes_from_checkpoint_without_redoing_work(db, settings, no_wait_limiter, monkeypatch):
-    fake = FakeOSM(overpass_fn=_quarter_elements)
-    add_job(db)
-    job = q.claim_next_job(db.scrapingJobs, "w1")
+def _run(db, settings, fake, job):
+    return run_job(db, job, settings, client=fake.client(settings), sleep=lambda _s: None,
+                   web_transport=FakeWeb().transport())
 
+
+def _crash_at_osm_checkpoint(monkeypatch, n):
+    """Kill the worker right after the n-th mid-file OSM checkpoint was saved."""
     real_save = q.save_checkpoint
     saves = []
 
-    def crash_after_two_pieces(jobs, job_id, key, value):
+    def crash(jobs, job_id, key, value):
         real_save(jobs, job_id, key, value)
-        if key == "discovery" and not value.get("complete"):
-            saves.append(1)
-            if len(saves) == 2:
+        if key == "osm" and value.get("position"):
+            saves.append(value["position"])
+            if len(saves) == n:
                 raise Crash()
 
-    monkeypatch.setattr(q, "save_checkpoint", crash_after_two_pieces)
-    with pytest.raises(Crash):
-        run_job(db, job, settings, client=fake.client(settings), sleep=lambda _s: None, limiter=no_wait_limiter,
-                web_transport=FakeWeb().transport())
-    assert db.leads.count_documents({}) == 2
-    queries_before = len(fake.queries())
-    monkeypatch.setattr(q, "save_checkpoint", real_save)
+    monkeypatch.setattr(q, "save_checkpoint", crash)
+    return real_save
 
-    # The worker restarts: the job is re-queued (checkpoint kept) and claimed again.
-    db.scrapingJobs.update_one({"_id": job["_id"]}, {"$set": {"lockedAt": q.now() - timedelta(hours=1)}})
+
+def _restart(db, job_id):
+    db.scrapingJobs.update_one({"_id": job_id}, {"$set": {"lockedAt": q.now() - timedelta(hours=1)}})
     q.recover_stale_jobs(db.scrapingJobs, 600, 3, rand=lambda: 0)
-    db.scrapingJobs.update_one({"_id": job["_id"]}, {"$set": {"nextAttemptAt": q.now()}})
-    job = q.claim_next_job(db.scrapingJobs, "w2")
-    status = run_job(db, job, settings, client=fake.client(settings), sleep=lambda _s: None, limiter=no_wait_limiter,
-                     web_transport=FakeWeb().transport())
-
-    assert status == "completed"
-    assert fake.count("nominatim.test") == 0  # no external geocoding service, ever
-    assert len(fake.queries()) - queries_before == 2  # only the 2 quarters that weren't finished
-    assert db.leads.count_documents({}) == 4  # all four quarters, nothing twice
-    done = db.scrapingJobs.find_one({"_id": job["_id"]})
-    assert done["stats"]["newLeads"] == 4 and done["stats"]["discovered"] == 4  # counts continued
-    assert done["checkpoint"]["discovery"]["complete"] is True and done["progress"]["pct"] == 100
+    db.scrapingJobs.update_one({"_id": job_id}, {"$set": {"nextAttemptAt": q.now()}})
+    return q.claim_next_job(db.scrapingJobs, "w2")
 
 
-def test_finished_discovery_is_not_repeated_on_retry(db, settings, no_wait_limiter):
-    fake = FakeOSM(overpass_fn=_quarter_elements)
+def _count_processed(monkeypatch):
+    from app import leads as leads_mod
+
+    seen = []
+    real = leads_mod.upsert_lead
+
+    def spy(coll, **kw):
+        seen.append(kw["lead"]["externalIds"]["osm"])
+        return real(coll, **kw)
+
+    monkeypatch.setattr("app.pipeline.leads.upsert_lead", spy)
+    return seen
+
+
+def test_crashed_job_resumes_from_checkpoint_with_the_same_extract_version(db, settings, monkeypatch):
+    fake = FakeOSM(elements=GYMS)
     add_job(db)
     job = q.claim_next_job(db.scrapingJobs, "w1")
-    run_job(db, job, settings, client=fake.client(settings), sleep=lambda _s: None, limiter=no_wait_limiter,
-            web_transport=FakeWeb().transport())
-    before = len(fake.queries())
+    real_save = _crash_at_osm_checkpoint(monkeypatch, 2)  # after element 50 of 60
+    with pytest.raises(Crash):
+        _run(db, settings, fake, job)
+    assert db.leads.count_documents({}) == 50
+    pinned = db.scrapingJobs.find_one({"_id": job["_id"]})["checkpoint"]["osm"]["extracts"][0]
+    monkeypatch.setattr(q, "save_checkpoint", real_save)
+
+    processed = _count_processed(monkeypatch)
+    job = _restart(db, job["_id"])
+    assert _run(db, settings, fake, job) == "completed"
+    assert processed == [f"node/{i}" for i in range(51, 61)]  # only the 10 elements not done before
+    assert len(fake.downloads()) == 1  # the extract wasn't downloaded again
+    done = db.scrapingJobs.find_one({"_id": job["_id"]})
+    assert db.leads.count_documents({}) == 60 and done["stats"]["newLeads"] == 60  # nothing twice, counts continued
+    assert done["location"]["osmExtract"]["extracts"][0]["sha256"] == pinned["sha256"]
+    assert done["checkpoint"]["osm"]["complete"] is True and done["progress"]["pct"] == 100
+    assert db.osmExtracts.find_one({"_id": "great-britain"})["readers"] == []  # pins released
+
+
+def test_a_new_extract_published_meanwhile_is_not_mixed_into_a_running_job(db, settings, monkeypatch):
+    fake = FakeOSM(elements=GYMS)
+    add_job(db)
+    job = q.claim_next_job(db.scrapingJobs, "w1")
+    real_save = _crash_at_osm_checkpoint(monkeypatch, 1)  # after element 25
+    with pytest.raises(Crash):
+        _run(db, settings, fake, job)
+    monkeypatch.setattr(q, "save_checkpoint", real_save)
+    old_sha = db.scrapingJobs.find_one({"_id": job["_id"]})["checkpoint"]["osm"]["extracts"][0]["sha256"]
+
+    # Meanwhile a refresh publishes a newer version with an extra gym.
+    fake.elements = [*GYMS, {"type": "node", "id": 999, "lat": 51.5, "lon": -0.1, "tags": {"name": "New", "sport": "boxing"}}]
+    fake.set_version("great-britain", "great-britain-261120")
+    from app.osm import extracts
+    cfg = extracts.ExtractConfig.from_settings(settings)
+    cache = extracts.ExtractCache(db, cfg, owner="refresher", client=fake.client(settings))
+    assert cache.acquire_refresh("great-britain")
+    cache.refresh(extracts.GeofabrikIndex.load(fake.client(settings), cfg).by_id["great-britain"])
+    cache.release_refresh("great-britain")
+
+    processed = _count_processed(monkeypatch)
+    job = _restart(db, job["_id"])
+    _run(db, settings, fake, job)
+    assert "node/999" not in processed and processed[0] == "node/26"  # finished on the version it started with
+    done = db.scrapingJobs.find_one({"_id": job["_id"]})
+    assert done["location"]["osmExtract"]["extracts"][0]["sha256"] == old_sha
+
+
+def test_if_the_pinned_version_is_gone_the_osm_stage_restarts_without_duplicates(db, settings, monkeypatch):
+    fake = FakeOSM(elements=GYMS)
+    add_job(db)
+    job = q.claim_next_job(db.scrapingJobs, "w1")
+    real_save = _crash_at_osm_checkpoint(monkeypatch, 1)
+    with pytest.raises(Crash):
+        _run(db, settings, fake, job)
+    monkeypatch.setattr(q, "save_checkpoint", real_save)
+    info = db.scrapingJobs.find_one({"_id": job["_id"]})["checkpoint"]["osm"]["extracts"][0]
+    from pathlib import Path
+    (Path(settings.osm_cache_dir) / info["file"]).unlink()  # e.g. evicted after its pin expired
+    db.osmExtracts.update_one({"_id": "great-britain"}, {"$set": {"current": None, "status": "evicted", "readers": []}})
+
+    job = _restart(db, job["_id"])
+    assert _run(db, settings, fake, job) == "completed"
+    done = db.scrapingJobs.find_one({"_id": job["_id"]})
+    assert db.leads.count_documents({}) == 60  # restarted from the start: upserts, no duplicate leads
+    assert any("starts again" in e["message"] for e in done["errorLog"])
+    assert len(fake.downloads()) == 2
+
+
+def test_finished_osm_stage_is_not_repeated_on_retry(db, settings):
+    fake = FakeOSM(elements=GYMS)
+    add_job(db)
+    job = q.claim_next_job(db.scrapingJobs, "w1")
+    _run(db, settings, fake, job)
+    calls = len(fake.calls)
     job = db.scrapingJobs.find_one({"_id": job["_id"]})  # e.g. the crawl stage crashed afterwards
-    run_job(db, job, settings, client=fake.client(settings), sleep=lambda _s: None, limiter=no_wait_limiter,
-            web_transport=FakeWeb().transport())
-    assert len(fake.queries()) == before and db.leads.count_documents({}) == 4
+    _run(db, settings, fake, job)
+    assert len(fake.calls) == calls and db.leads.count_documents({}) == 60  # no request, no re-processing
 
 
 # ---------------------------------------------------------------- crawler retry
