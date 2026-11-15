@@ -159,6 +159,22 @@ OpenStreetMap from Geofabrik extracts (Phase 2b, 2026-11-15). Public Overpass is
   runtime before every download and write. Run `npm run db:indexes` once (adds `osmExtracts`).
 - Pilot/measurement: `worker/scripts/pilot_extract.py` (see its docstring; never writes to MongoDB Atlas).
 
+Overture Maps Places (Phase 2c, 2026-11-15), a separate "overture" data lane:
+- Official Overture Places GeoParquet on public S3, read with DuckDB (httpfs is installed into the image at
+  build time). The release is the STAC catalogue's "latest" (cached 6 h) or `OVERTURE_RELEASE` if pinned.
+- Only gym/combat-sport taxonomy IDs, confidence >= `OVERTURE_MIN_CONFIDENCE` (0.5), not permanently closed.
+  There are no MMA or wrestling IDs in Overture; those categories come from OSM only.
+- Results are cached per release per 1-degree tile on the Volume (`OVERTURE_CACHE_DIR=/data/overture`,
+  512 MB budget, LRU, old releases evicted first; MongoDB `overtureTiles` / `overtureReleases` hold metadata).
+  Leases + reader pins as for OSM extracts. Jobs checkpoint which tile/row they reached and resume there.
+- Overture leads are NEVER matched, merged or linked with OSM leads (licensing mode M2): the same gym can
+  appear once per lane. Dedupe inside the lane uses the GERS ID, its aliases and the upstream source record keys.
+- Provenance per lead: GERS ID, release, upstream sources + licences. Exports have "Data lane", "License",
+  "Overture ID", "Overture release" columns and separate attribution lines (OSM: ODbL; Overture:
+  CDLA-Permissive-2.0 / Apache-2.0, "© Overture Maps Foundation, overturemaps.org").
+- Dashboard: Source filter (All sources / OSM only / Overture only). Find Leads: OSM and Overture checkboxes.
+- Run `npm run db:indexes` once (new lead indexes + `overtureTiles`). Pilot: `worker/scripts/pilot_overture.py`.
+
 ## Build steps
 1. ✅ Setup, models + indexes, auth, job queue
 2. ✅ OpenStreetMap discovery (Nominatim + Overpass)

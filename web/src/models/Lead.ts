@@ -4,7 +4,10 @@ import { CATEGORY_IDS } from "@/lib/categories";
 // Leads are WRITTEN by the Python worker and READ/updated (saved, status, notes) by the web app.
 // Every contact value carries where it was found, so nothing in the table is unexplained.
 // "google" appears only in `sources` (a Google Maps link by place ID), never on a stored value.
-const SOURCE_TYPES = ["osm", "website", "search", "google"] as const;
+const SOURCE_TYPES = ["osm", "website", "search", "google", "overture"] as const;
+// Licensing mode M2: every lead is in exactly ONE data lane, never matched/merged across lanes.
+// Leads saved before Phase 2c have no dataLane and are "osm".
+export const DATA_LANES = ["osm", "overture"] as const;
 const sourceFields = {
   sourceUrl: { type: String, required: true },
   sourceType: { type: String, enum: SOURCE_TYPES, required: true },
@@ -84,14 +87,25 @@ const leadSchema = new Schema(
       tiktok: { type: socialSchema, default: undefined },
     },
     // googlePlaceId: Google allows storing place IDs indefinitely; no other Google content is stored.
-    externalIds: { osm: String, osmAliases: { type: [String], default: undefined }, foursquare: String, googlePlaceId: String },
+    dataLane: { type: String, enum: DATA_LANES },
+    externalIds: {
+      osm: String,
+      osmAliases: { type: [String], default: undefined },
+      overture: String, // Overture (GERS) id
+      overtureAliases: { type: [String], default: undefined }, // earlier GERS ids / merged duplicates (same lane)
+      overtureSources: { type: [String], default: undefined }, // upstream record ids, e.g. "meta:798829223526334"
+      foursquare: String,
+      googlePlaceId: String,
+    },
+    // Overture provenance: release, GERS id, taxonomy, confidence, per-source dataset + license
+    overture: { type: Schema.Types.Mixed, default: undefined },
     // Provenance of non-contact fields: { name: { sourceType, sourceUrl }, address: ..., geo: ..., website: ... }
     fieldSources: { type: Schema.Types.Mixed, default: undefined },
     // name + ~110 m grid cell; backs a unique index so two workers can't insert the same business at once
     dedupeKey: String,
     googleMatch: { matchedAt: Date, method: String },
     googleSeenAt: Date,
-    mergeLog: { type: [{ _id: false, at: Date, osm: String, reason: String }], default: undefined },
+    mergeLog: { type: [{ _id: false, at: Date, osm: String, overture: String, reason: String }], default: undefined },
     sources: [{ _id: false, url: String, type: { type: String, enum: SOURCE_TYPES }, fetchedAt: Date }],
     // "verified" = a person verified a contact. "partial" is the pre-migration name of "unchecked".
     contactStatus: { type: String, enum: ["none", "unchecked", "checked", "verified", "partial"], default: "none" },
@@ -118,6 +132,14 @@ leadSchema.index(
 );
 // Same business under another OSM id (node + building) is merged into one lead: its id becomes an alias.
 leadSchema.index({ ownerId: 1, "externalIds.osmAliases": 1 });
+// Overture lane: one lead per Overture place per user; GERS-id changes resolved via aliases/source ids.
+leadSchema.index(
+  { ownerId: 1, "externalIds.overture": 1 },
+  { unique: true, partialFilterExpression: { "externalIds.overture": { $type: "string" } } }
+);
+leadSchema.index({ ownerId: 1, "externalIds.overtureAliases": 1 });
+leadSchema.index({ ownerId: 1, "externalIds.overtureSources": 1 });
+leadSchema.index({ ownerId: 1, dataLane: 1, discoveredAt: -1 }); // the Source filter
 // One lead per Google place, per user.
 leadSchema.index(
   { ownerId: 1, "externalIds.googlePlaceId": 1 },

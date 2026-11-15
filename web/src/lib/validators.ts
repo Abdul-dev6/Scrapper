@@ -27,7 +27,12 @@ export const createJobSchema = z.object({
   // The place the user picked from the search results (gazetteer id). Required: no free-text geocoding.
   placeId: z.string().regex(PLACE_ID_RE, "Pick a place from the list"),
   categories: z.array(z.enum(CATEGORY_IDS)).min(1, "Pick at least one category").max(CATEGORY_IDS.length),
-  sources: z.array(z.enum(SOURCES)).min(1).max(SOURCES.length).default(["osm"]),
+  sources: z
+    .array(z.enum(SOURCES))
+    .min(1)
+    .max(SOURCES.length)
+    .refine((s) => new Set(s).size === s.length, "Each source may be listed once")
+    .default(["osm"]),
 });
 
 export type CreateJobInput = z.infer<typeof createJobSchema>;

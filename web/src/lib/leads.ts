@@ -26,6 +26,8 @@ export const leadQuerySchema = z.object({
   status: z.enum(["new", "contacted", "not_interested"]).optional(),
   saved: yes,
   job: z.string().regex(/^[a-f\d]{24}$/i).optional(),
+  // Data lane (licensing mode M2): all sources, OpenStreetMap only, or Overture Maps only.
+  lane: z.enum(["all", "osm", "overture"]).default("all"),
   sort: z.enum(["newest", "oldest", "name", "confidence"]).default("newest"),
   page: z.coerce.number().int().min(1).max(10_000).default(1),
 });
@@ -65,6 +67,9 @@ export function leadFilter(ownerId: Types.ObjectId, q: LeadQuery): FilterQuery<u
   if (q.status) f.status = q.status;
   if (q.saved) f.saved = q.saved === "1" ? true : { $ne: true };
   if (q.job) f.jobIds = new Types.ObjectId(q.job);
+  // Leads saved before Phase 2c have no dataLane: they are OpenStreetMap leads.
+  if (q.lane === "overture") f.dataLane = "overture";
+  if (q.lane === "osm") f.dataLane = { $ne: "overture" };
   if (and.length) f.$and = and;
   return f;
 }
@@ -80,7 +85,7 @@ export const SORTS: Record<LeadQuery["sort"], Record<string, 1 | -1>> = {
 export const LIST_FIELDS =
   "name categories address.city address.countryCode website.url website.domain website.reachable " +
   "emails.value emails.mxValid emails.checks phones.e164 phones.raw phones.checks whatsapp.e164 socials contactStatus confidence " +
-  "saved status discoveredAt";
+  "saved status discoveredAt dataLane";
 
 // ---------- export ----------
 
@@ -95,7 +100,9 @@ export type ExportLead = {
   phones?: ({ e164?: string | null; raw?: string | null; checks?: PhoneChecks | null } & Src)[] | null;
   whatsapp?: ({ e164?: string | null; url?: string | null } & Src)[] | null;
   socials?: Record<string, ({ url?: string | null } & Src) | null | undefined> | null;
-  externalIds?: { osm?: string | null } | null; // no Google fields: nothing from Google is ever exported
+  externalIds?: { osm?: string | null; overture?: string | null } | null; // nothing from Google is ever exported
+  dataLane?: string | null;
+  overture?: { release?: string | null; sources?: { dataset?: string | null; license?: string | null }[] | null } | null;
   fieldSources?: Record<string, { sourceType?: string | null } | null | undefined> | null;
   verifiedAt?: Date | null;
   contactStatus?: string | null;
@@ -121,6 +128,7 @@ export const EXPORT_COLUMNS = [
   ...SOCIALS.map((s) => s[0].toUpperCase() + s.slice(1)),
   "Contact status", "Confidence", "Lead status", "Saved", "Notes",
   "Data sources", "Last contact check", "OpenStreetMap", "Contact source pages", "Found on",
+  "Data lane", "License", "Overture ID", "Overture release",
 ] as const;
 
 const CONTACT_STATUS_TEXT: Record<string, string> = {
@@ -129,7 +137,16 @@ const CONTACT_STATUS_TEXT: Record<string, string> = {
 const MX_TEXT = { valid: "mail server found", no_mx: "no mail server", unknown: "not checked" } as const;
 const yesNo = (v: boolean | null | undefined) => (v ? "yes" : "no");
 
-const SOURCE_NAMES: Record<string, string> = { osm: "OpenStreetMap", website: "Business website" };
+const SOURCE_NAMES: Record<string, string> = { osm: "OpenStreetMap", website: "Business website", overture: "Overture Maps" };
+export const laneOf = (l: { dataLane?: string | null }) => (l.dataLane === "overture" ? "overture" : "osm");
+const LANE_NAME = { osm: "OpenStreetMap", overture: "Overture Maps" } as const;
+
+/** The licence that applies to this row's map data (per source for Overture). */
+function licenseOf(l: ExportLead): string {
+  if (laneOf(l) === "osm") return "ODbL 1.0 (© OpenStreetMap contributors)";
+  const per = [...new Set((l.overture?.sources ?? []).map((s) => s.license).filter(Boolean))] as string[];
+  return `${per.length ? per.join(" / ") : "CDLA-Permissive-2.0 / Apache-2.0"} (Overture Maps Foundation)`;
+}
 const day = (d?: Date | string | null) => (d ? new Date(d).toISOString().slice(0, 10) : "");
 /** Like join, but keeps repeats: one status per value, in the same order as the values column. */
 const each = (xs: string[]) => xs.join("; ");
@@ -189,16 +206,22 @@ export function exportRow(l: ExportLead): string[] {
     l.notes ?? "",
     dataSources(l),
     day(l.verifiedAt),
-    l.externalIds?.osm ? `https://www.openstreetmap.org/${l.externalIds.osm}` : "",
+    laneOf(l) === "osm" && l.externalIds?.osm ? `https://www.openstreetmap.org/${l.externalIds.osm}` : "",
     join(sources),
     day(l.discoveredAt),
+    LANE_NAME[laneOf(l)],
+    licenseOf(l),
+    laneOf(l) === "overture" ? l.externalIds?.overture ?? "" : "",
+    laneOf(l) === "overture" ? l.overture?.release ?? "" : "",
   ];
 }
 
 export const EXPORT_ATTRIBUTION = [
   ["About this data"],
-  ["Business data © OpenStreetMap contributors, available under the Open Database License (ODbL): https://www.openstreetmap.org/copyright"],
-  ["If you share or publish this data, keep this attribution and share derived databases under the ODbL."],
+  ["The two map sources are kept apart: each row's 'Data lane' says which one it came from; rows from the two sources are never matched or merged."],
+  ["OpenStreetMap rows: © OpenStreetMap contributors, available under the Open Database License (ODbL): https://www.openstreetmap.org/copyright"],
+  ["If you share or publish OpenStreetMap rows, keep this attribution and share derived databases under the ODbL."],
+  ["Overture Maps rows: Overture Maps Foundation, overturemaps.org. Licensed per upstream source (see each row's 'License': CDLA-Permissive-2.0 or Apache-2.0); Foursquare-sourced records: Copyright 2024 Foursquare Labs, Inc., Apache License 2.0."],
   ["Contact details were read from each business's own public website; the page is listed in 'Contact source pages'."],
   ["Emails were checked by syntax and DNS (MX) only; nobody was emailed. Phones were checked with libphonenumber."],
   ["'Email MX check' only means the email's domain accepts mail; nobody was emailed. 'Verified by you' is set only by a person."],

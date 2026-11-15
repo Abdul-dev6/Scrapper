@@ -88,3 +88,6 @@ a new concept. Explain WHY a solution works, not only what changed.
 9. ✅ Phase 2b (same branch): Geofabrik extracts replace public Overpass completely (no fallback). Filtered
    gym files on the Railway Volume (/data/osm), metadata in `osmExtracts`; leases, pins, LRU eviction,
    stale-while-refresh. pyosmium only loads in the Docker image (Windows App Control blocks it locally).
+10. ✅ Phase 2c (same branch): Overture Places via DuckDB over S3 GeoParquet, "overture" lane (`dataLane`),
+   per-release 1° tile cache (/data/overture, `overtureTiles`), GERS IDs + aliases + provenance, Source
+   filter, source-aware exports. Never matched with OSM. Leads without `dataLane` are OSM.

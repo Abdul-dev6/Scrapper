@@ -11,6 +11,7 @@ Stages (progress bar):
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 
@@ -27,6 +28,8 @@ from .google.runner import GoogleRun, make_usage
 from .google.usage import UsageLimiter
 from .geo.boundaries import AreaError, Boundaries
 from .osm import extracts as osm_extracts
+from .overture import mapping as ov_mapping
+from .overture import places as ov_places
 from .osm import mapping
 from .osm.ratelimit import RateLimiter
 
@@ -41,7 +44,7 @@ class TransientJobError(RuntimeError):
 
 TRANSIENT_ERRORS = (
     TransientJobError,
-    osm_extracts.ExtractUnavailable,  # Geofabrik down / download broken: retried with backoff
+    osm_extracts.ExtractUnavailable,  # Geofabrik / Overture down, download broken: retried with backoff
     httpx.TransportError,
     mongo_errors.AutoReconnect,  # includes NetworkTimeout / connection failures
     mongo_errors.ServerSelectionTimeoutError,
@@ -54,7 +57,9 @@ def is_transient(exc: BaseException) -> bool:
 
 # Kept for the run_job(limiter=...) signature; no rate-limited geocoding service is called any more.
 NOMINATIM_LIMITER = RateLimiter(min_interval=0)
+log = logging.getLogger(__name__)
 SAVE_PROGRESS_EVERY = 25
+OVERTURE_WRITE_BATCH = 500  # Overture leads per batched MongoDB write (2 round trips per batch)
 _BOUNDARIES: Boundaries | None = None
 
 
@@ -100,6 +105,7 @@ def run_job(
     google_transport: httpx.BaseTransport | None = None,
     usage: UsageLimiter | None = None,
     extract_filter: osm_extracts.FilterFn | None = None,
+    overture_query: ov_places.QueryFn | None = None,
 ) -> str:
     """Run a job and return its final status: 'completed' or 'partial'.
 
@@ -114,7 +120,7 @@ def run_job(
                        transport=google_transport, sleep=sleep)
     try:
         return _run(db, job, settings, client, sleep or time.sleep, limiter or NOMINATIM_LIMITER,
-                    web_transport, mx_resolve, google, host_resolve, extract_filter)
+                    web_transport, mx_resolve, google, host_resolve, extract_filter, overture_query)
     finally:
         google.close()  # also stops the Google thread if the job was cancelled or crashed
         if own_client:
@@ -123,7 +129,7 @@ def run_job(
 
 def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, sleep, limiter,
          web_transport=None, mx_resolve=None, google: GoogleRun | None = None, host_resolve=None,
-         extract_filter=None) -> str:
+         extract_filter=None, overture_query=None) -> str:
     jobs = db.scrapingJobs
     job_id, owner_id = job["_id"], job["ownerId"]
 
@@ -172,7 +178,15 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
     # The cached extract holds every category (it is shared by all searches); like the old Overpass
     # query, a job keeps only places matching at least one of ITS selected categories.
     wanted = set(job.get("categories") or [])
+    sources = set(job.get("sources") or ["osm"])
+    run_overture = "overture" in sources
+    # OSM runs unless the job chose ONLY Overture (older jobs, e.g. sources ["google"], always ran OSM).
+    run_osm = "osm" in sources or not run_overture
+    # The map stages share 10-60% of the progress bar.
+    osm_share = DISCOVER_SHARE / 2 if (run_osm and run_overture) else DISCOVER_SHARE
     saved = checkpoint.get("osm") or {}
+    if not run_osm:
+        saved = {"complete": True}  # Overture-only search: the OSM stage is skipped entirely
     if saved:  # resuming: keep counting from where the last attempt stopped
         stats.update({k: (job.get("stats") or {}).get(k, 0) for k in stats})
         processed = saved.get("counters", {}).get("processed", 0)
@@ -226,7 +240,7 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
             start = saved.get("position", 0) if k == first else 0
             data_date = (pin.osm_timestamp or pin.version)[:10]
             progress(stage=f"Processing gyms from {pin.name} (OpenStreetMap data of {data_date})",
-                     pct=10 + DISCOVER_SHARE * min(1.0, done_before / total))
+                     pct=10 + osm_share * min(1.0, done_before / total))
             for i, element in osm_extracts.read_elements(cache.abs(pin.file), start):
                 processed += 1
                 try:
@@ -259,7 +273,7 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
                     _save_stats(jobs, job_id, stats)
                     # Everything up to element i is saved: a restart continues at i + 1 (same version).
                     q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k, "position": i + 1, "counters": counters()})
-                    progress(pct=10 + DISCOVER_SHARE * min(1.0, (done_before + i - start + 1) / total),
+                    progress(pct=10 + osm_share * min(1.0, (done_before + i - start + 1) / total),
                              processed=processed, total=total, stage=f"Processing gyms: {stats['discovered']} found")
                     if time.monotonic() - last_renew > 60:
                         cache.renew(pins)  # long jobs keep their files pinned
@@ -272,10 +286,18 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
         for p in pins:
             cache.unpin(p)
     _save_stats(jobs, job_id, stats)
-    progress(stage=f"OpenStreetMap: {stats['discovered']} gyms found", pct=10 + DISCOVER_SHARE)
+    if run_osm:
+        progress(stage=f"OpenStreetMap: {stats['discovered']} gyms found", pct=10 + osm_share)
 
     if processed and element_failures == processed:
         raise RuntimeError("None of the businesses could be saved. Check the worker logs.")
+
+    # 3c. Overture Maps (separate lane: never matched with the OSM leads above).
+    if run_overture:
+        ov_failures = _overture_stage(db, job, settings, client, area, progress, hashes, wanted, overture_query,
+                                      sleep, checkpoint, pct_from=10 + (osm_share if run_osm else 0),
+                                      pct_to=10 + DISCOVER_SHARE)
+        element_failures += ov_failures
 
     # 3b. Merge what Google found (waits for the Google thread, with heartbeats).
     google_problem = False
@@ -318,3 +340,134 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
 def _save_stats(jobs, job_id, stats: dict) -> None:
     # Field by field, so stats.errors (incremented by log_error) isn't overwritten.
     jobs.update_one({"_id": job_id}, {"$set": {f"stats.{k}": v for k, v in stats.items()}})
+
+
+def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, query_fn, sleep, checkpoint,
+                    *, pct_from: float, pct_to: float) -> int:
+    """Overture places for the area, from the release pinned for this job, into the "overture" lane.
+    Same safety as the OSM stage: pinned immutable tile files, element-position checkpoints, retries.
+    Returns the number of elements that failed to save."""
+    jobs = db.scrapingJobs
+    job_id, owner_id = job["_id"], job["ownerId"]
+    keys = ("discovered", "withWebsite", "newLeads", "updated", "merged", "duplicates", "suppressed",
+            "outsideArea", "otherCategory", "processed", "failures")
+    saved = checkpoint.get("overture") or {}
+    stats = dict.fromkeys(keys, 0)
+    if saved:
+        stats.update({k: ((job.get("stats") or {}).get("overture") or {}).get(k, 0) for k in keys})
+    cfg = ov_places.OvertureConfig.from_settings(settings)
+    cache = ov_places.TileCache(db, cfg, owner=f"{settings.worker_id}:{job_id}", query_fn=query_fn, sleep=sleep)
+    pins: list[ov_places.TilePin] = []
+
+    def save_progress(extra: dict) -> None:
+        jobs.update_one({"_id": job_id}, {"$set": {f"stats.overture.{k}": v for k, v in stats.items()}})
+        q.save_checkpoint(jobs, job_id, "overture", {**saved, **extra})
+
+    try:
+        if saved.get("tiles") and not saved.get("complete"):
+            for info in saved["tiles"]:
+                pin = cache.pin_saved(info, job_id=job_id)
+                if pin is None:  # that release's tile is gone: start this stage again (upserts: no duplicates)
+                    for p in pins:
+                        cache.unpin(p)
+                    pins = []
+                    q.log_error(jobs, job_id, "overture", "The Overture Maps data used before the restart is no "
+                                "longer cached; the Overture stage starts again (saved leads are kept, not duplicated).")
+                    saved = {}
+                    break
+                pins.append(pin)
+        if not saved.get("complete") and not pins:
+            progress(stage="Selecting Overture Maps release", pct=pct_from)
+            release = ov_places.current_release(db, client, cfg)
+            tiles = ov_places.tiles_for(area.geometry, cfg.max_tiles_per_job)
+            pins = cache.ensure(release, tiles, job_id=job_id, heartbeat=lambda: progress(),
+                                on_stage=lambda st: progress(stage=st))
+            saved = {"release": release, "tiles": [p.as_checkpoint() for p in pins], "index": 0, "position": 0}
+            save_progress({})
+        if pins:
+            jobs.update_one({"_id": job_id}, {"$set": {"location.overture": {
+                "provider": "overture", "release": pins[0].release, "tiles": len(pins),
+                "features": sum(p.features for p in pins),
+                "license": "CDLA-Permissive-2.0 / Apache-2.0 (per source); Overture Maps Foundation, overturemaps.org"}}})
+        seen: set[str] = set()
+        total = sum(p.features for p in pins) or 1
+        first = saved.get("index", 0)
+        done = sum(p.features for p in pins[:first]) + saved.get("position", 0)
+        release = saved.get("release", "")
+        pending: list[tuple[dict, str]] = []  # (lead, provenance id) waiting for the next batched write
+
+        def flush() -> None:
+            """Write the pending leads (one read + one bulk write). Per-lead problems are logged, not fatal."""
+            if not pending:
+                return
+            batch = [lead for lead, _ in pending]
+            try:
+                results = leads.upsert_overture_batch(db.leads, owner_id=owner_id, job_id=job_id, items=batch,
+                                                      now=q.now())
+            except Exception as exc:  # the batch itself failed (e.g. connection): one lead at a time
+                log.warning("Overture batch write failed (%s); saving one by one", exc)
+                results = []
+                for lead in batch:
+                    try:
+                        results.append(leads.upsert_overture_lead(db.leads, owner_id=owner_id, job_id=job_id,
+                                                                  lead=lead, now=q.now()))
+                    except Exception as one:  # noqa: BLE001
+                        results.append(one)
+            for (_, prov), result in zip(pending, results, strict=True):
+                if isinstance(result, Exception):
+                    stats["failures"] += 1
+                    q.log_error(jobs, job_id, "overture", f"{type(result).__name__}: {result}", url=prov)
+                else:
+                    stats[{"new": "newLeads", "merged": "merged"}.get(result, "updated")] += 1
+            pending.clear()
+
+        for k, pin in enumerate(pins):
+            if k < first:
+                continue
+            start = saved.get("position", 0) if k == first else 0
+            for i, row in ov_places.read_rows(cache, pin, start):
+                stats["processed"] += 1
+                try:
+                    if not area.contains(float(row["lat"]), float(row["lon"])):
+                        stats["outsideArea"] += 1
+                        continue
+                    lead = ov_mapping.row_to_lead(row, release=pin.release, now=q.now())
+                    if lead is None:
+                        continue
+                    if wanted and not wanted & set(lead["categories"]):
+                        stats["otherCategory"] += 1
+                        continue
+                    if lead["externalIds"]["overture"] in seen:
+                        stats["duplicates"] += 1
+                        continue
+                    seen.add(lead["externalIds"]["overture"])
+                    stats["discovered"] += 1
+                    stats["withWebsite"] += "website" in lead
+                    if suppression.is_suppressed(lead, hashes):
+                        stats["suppressed"] += 1
+                        continue
+                    pending.append((lead, ov_mapping.provenance_id(release or pin.release, str(row.get("id")))))
+                except Exception as exc:  # one bad record must not lose the rest
+                    stats["failures"] += 1
+                    q.log_error(jobs, job_id, "overture", f"{type(exc).__name__}: {exc}",
+                                url=ov_mapping.provenance_id(release, str(row.get("id"))))
+                if len(pending) >= OVERTURE_WRITE_BATCH:
+                    flush()
+                    # The checkpoint only moves past rows that are written (a restart redoes the rest).
+                    save_progress({"index": k, "position": i + 1})
+                if stats["processed"] % SAVE_PROGRESS_EVERY == 0:
+                    progress(pct=pct_from + (pct_to - pct_from) * min(1.0, (done + i - start + 1) / total),
+                             stage=f"Processing Overture Maps gyms: {stats['discovered']} found")
+                    cache.renew(pins)
+            flush()
+            done += pin.features - start
+            save_progress({"index": k + 1, "position": 0})
+        flush()
+        save_progress({"complete": True})
+    finally:
+        for p in pins:
+            cache.unpin(p)
+    progress(stage=f"Overture Maps: {stats['discovered']} gyms found", pct=pct_to)
+    if stats["processed"] and stats["failures"] == stats["processed"]:
+        raise RuntimeError("None of the Overture Maps places could be saved. Check the worker logs.")
+    return stats["failures"]

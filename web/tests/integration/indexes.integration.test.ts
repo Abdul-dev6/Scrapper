@@ -36,4 +36,7 @@ test("all indexes build, including osmExtracts and gazetteer", async () => {
   assert.ok(names.gazetteer.includes("keys_1_population_-1")); // same name the worker's loader uses
   assert.ok(names.leads.includes("ownerId_1_externalIds.osm_1")); // existing lead indexes unchanged
   assert.ok(names.leads.includes("ownerId_1_dedupeKey_1"));
+  assert.ok(names.leads.includes("ownerId_1_externalIds.overture_1")); // one lead per Overture place per user
+  assert.ok(names.leads.includes("ownerId_1_dataLane_1_discoveredAt_-1")); // the Source filter
+  assert.ok(names.overtureTiles.includes("status_1_lastAccessAt_1"));
 });

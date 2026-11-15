@@ -12,6 +12,7 @@ type Job = {
     query: string;
     displayName?: string;
     osmExtract?: { provider: string; extracts: { name: string; version: string; osmTimestamp?: string | null; features?: number }[] };
+    overture?: { release: string; tiles: number; features?: number };
   };
   categories: string[];
   sources?: string[];
@@ -29,6 +30,7 @@ type Job = {
     websitesChecked?: number;
     websitesReachable?: number;
     withEmail?: number;
+    overture?: { discovered?: number; newLeads?: number; updated?: number; merged?: number };
   };
   lockedAt?: string;
   nextAttemptAt?: string; // set while a job waits to retry after a temporary problem
@@ -335,6 +337,14 @@ function JobDetails({ job }: { job: Job }) {
             .map((e) => `${e.name}, data of ${(e.osmTimestamp || e.version).slice(0, 10)}`)
             .join(" · ")}
           {" "}· © OpenStreetMap contributors (ODbL)
+        </p>
+      ) : null}
+      {job.location.overture ? (
+        <p className="text-sm text-muted">
+          Overture Maps release {job.location.overture.release} ({job.location.overture.tiles} map tile
+          {job.location.overture.tiles === 1 ? "" : "s"})
+          {job.stats.overture ? `: ${job.stats.overture.discovered ?? 0} gyms, ${job.stats.overture.newLeads ?? 0} new leads` : ""}
+          {" "}· Overture Maps Foundation (CDLA-Permissive-2.0 / Apache-2.0)
         </p>
       ) : null}
       {g && g.mode !== "off" && (

@@ -9,7 +9,8 @@ from . import jobs as q
 from .config import load_settings
 from .db import connect
 from .google.merge import purge_expired_locations
-from .osm.extracts import BackgroundRefresher, ExtractConfig
+from .osm.extracts import BackgroundRefresher, ExtractConfig, check_writable
+from .overture.places import OvertureConfig, TileCache
 from .pipeline import JobCancelled, is_transient, run_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -70,6 +71,11 @@ def main() -> None:
     refresher.start()
     log.info("OpenStreetMap cache budget %.1f GB on %s; temporary downloads in %s",
              extract_cfg.cache_max_bytes / 1024**3, extract_cfg.cache_dir, extract_cfg.tmp_dir)
+    # Overture Maps tiles: immutable per release, so no background refresh; just check + clean up.
+    ov_cfg = OvertureConfig.from_settings(settings)
+    check_writable(ov_cfg.cache_dir, "OVERTURE_CACHE_DIR")
+    log.info("Overture Maps cache on %s (budget %d MB): recovery %s", ov_cfg.cache_dir,
+             ov_cfg.cache_max_bytes // 1024**2, TileCache(db, ov_cfg, owner=f"{settings.worker_id}:startup").recover())
 
     last_recovery = 0.0
     try:

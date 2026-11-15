@@ -14,6 +14,9 @@ export default function FindLeadsForm() {
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [useGoogle, setUseGoogle] = useState(false); // Google is opt-in per search
+  // The two map sources (separate data lanes, never merged). At least one is needed.
+  const [useOsm, setUseOsm] = useState(true);
+  const [useOverture, setUseOverture] = useState(true);
   const usage = useGoogleUsage();
   // Place search: what the user typed -> candidates -> the one they picked (sent as placeId).
   const [query, setQuery] = useState("");
@@ -58,7 +61,7 @@ export default function FindLeadsForm() {
         location: chosen?.label.slice(0, 120) ?? query.trim(),
         placeId,
         categories: [...selected],
-        sources: useGoogle ? ["osm", "google"] : ["osm"],
+        sources: [...(useOsm ? ["osm"] : []), ...(useOverture ? ["overture"] : []), ...(useGoogle ? ["google"] : [])],
       }),
     }).catch(() => null);
 
@@ -140,7 +143,25 @@ export default function FindLeadsForm() {
 
       <fieldset className="space-y-3">
         <legend className="font-semibold">Sources</legend>
-        <p className="text-sm text-muted">OpenStreetMap is always searched, and each business&apos;s own website is checked for contact details.</p>
+        <p className="text-sm text-muted">Each business&apos;s own website is checked for contact details.</p>
+        <label className="flex items-start gap-2 rounded-md border border-line px-3 py-2 has-[:checked]:border-canvas has-[:checked]:bg-canvas/5">
+          <input type="checkbox" checked={useOsm} onChange={(e) => setUseOsm(e.target.checked)} className="mt-1 accent-canvas" />
+          <span>
+            <span className="block">OpenStreetMap</span>
+            <span className="block text-sm text-muted">Community map data (ODbL).</span>
+          </span>
+        </label>
+        <label className="flex items-start gap-2 rounded-md border border-line px-3 py-2 has-[:checked]:border-canvas has-[:checked]:bg-canvas/5">
+          <input type="checkbox" checked={useOverture} onChange={(e) => setUseOverture(e.target.checked)} className="mt-1 accent-canvas" />
+          <span>
+            <span className="block">Overture Maps</span>
+            <span className="block text-sm text-muted">
+              Open places data (CDLA-Permissive-2.0 / Apache-2.0). Kept as separate leads: never matched or merged with
+              OpenStreetMap, so the same gym can appear once per source.
+            </span>
+          </span>
+        </label>
+        {!useOsm && !useOverture && <p className="text-sm text-warn">Pick OpenStreetMap, Overture Maps or both.</p>}
         <label className="flex items-start gap-2 rounded-md border border-line px-3 py-2 has-[:checked]:border-canvas has-[:checked]:bg-canvas/5">
           <input type="checkbox" checked={useGoogle} onChange={(e) => setUseGoogle(e.target.checked)} className="mt-1 accent-canvas" />
           <span>
@@ -156,7 +177,7 @@ export default function FindLeadsForm() {
       </fieldset>
 
       {error && <p role="alert" className="text-sm text-bad">{error}</p>}
-      <button type="submit" disabled={pending || selected.size === 0 || !placeId}
+      <button type="submit" disabled={pending || selected.size === 0 || !placeId || (!useOsm && !useOverture)}
         className="rounded-md bg-canvas px-5 py-2 font-semibold text-white hover:bg-canvas-dark disabled:opacity-60">
         {pending ? "Starting…" : "Start search"}
       </button>

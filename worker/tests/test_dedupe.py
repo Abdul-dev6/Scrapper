@@ -166,3 +166,46 @@ def test_redirect_to_private_address_is_blocked():
 def test_public_site_still_crawled():
     web = FakeWeb(pages={"https://gym.test": "<html>ok</html>"})
     assert asyncio.run(_fetch(web, "https://gym.test/")).html == "<html>ok</html>"
+
+
+# ---------------------------------------------------------------- shared phones (chains) and big chains
+
+
+def test_chain_branches_sharing_a_head_office_phone_stay_separate(idb):
+    """GB pilot: 139 "The Gym Group" branches had been merged into one lead by their central number."""
+    central = "+44 300 303 4800"
+    assert save(idb, osm("node", 1, "The Gym Group", 51.5200, -0.1200, phone=central)) == "new"
+    assert save(idb, osm("node", 2, "The Gym Group", 51.4500, -0.0500, phone=central)) == "new"  # 7 km away
+    assert save(idb, osm("node", 3, "The Gym Group Leeds", 53.8000, -1.5500, phone=central)) == "new"
+    assert save(idb, osm("node", 4, "The Gym Group", 51.5201, -0.1201, phone=central)) == "merged"  # same spot
+    assert idb.leads.count_documents({}) == 3
+
+
+@pytest.mark.parametrize("d_m,same", [(10, True), (149, True), (160, False), (2000, False)])
+def test_phone_match_needs_the_same_spot(d_m, same):
+    a = {"name": "Iron Fist", "phones": [{"e164": "+442079460001"}], "geo": {"coordinates": [-0.1, 51.5]}}
+    b = {"name": "Iron Fist Boxing", "phones": [{"e164": "+442079460001"}],
+         "geo": {"coordinates": [-0.1, 51.5 + d_m / 111_195]}}
+    assert (dedupe.same_business(a, b) == "phone") is same
+
+
+@pytest.mark.parametrize("name_b,postcode_b,same", [
+    ("Iron Fist", "SW1X 7HN", True),  # no coordinates: identical name + same postcode
+    ("Iron Fist", None, True),  # no postcode on one side: identical name is enough
+    ("Iron Fist", "M1 1AA", False),  # different postcode: other branch
+    ("Steel Fist", "SW1X 7HN", False),  # different name, same phone + postcode: not enough
+])
+def test_phone_match_without_coordinates(name_b, postcode_b, same):
+    a = {"name": "Iron Fist", "phones": [{"e164": "+442079460001"}], "address": {"postcode": "SW1X7HN"}}
+    b = {"name": name_b, "phones": [{"e164": "+442079460001"}], "address": {"postcode": postcode_b}}
+    assert (dedupe.same_business(a, b) == "phone") is same
+
+
+def test_big_chain_still_finds_the_nearest_branch(idb):
+    """More same-name leads than the old 25-candidate limit: the duplicate must still find its branch."""
+    for i in range(40):
+        save(idb, osm("node", 100 + i, "Sports Direct", 50.0 + i * 0.1, -1.0))
+    assert save(idb, osm("way", 999, "Sports Direct", 50.0 + 39 * 0.1 + 0.0003, -1.0)) == "merged"
+    lead = idb.leads.find_one({"externalIds.osmAliases": "way/999"})
+    assert lead["externalIds"]["osm"] == "node/139"  # the branch 33 m away, not any other
+    assert idb.leads.count_documents({}) == 40

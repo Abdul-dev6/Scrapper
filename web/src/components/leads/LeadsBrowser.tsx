@@ -14,7 +14,7 @@ import {
 type Facets = { countries: { code: string; count: number }[]; jobs: { _id: string; label: string; createdAt: string; found: number }[] };
 type Page = { leads: LeadRow[]; total: number; page: number; pageSize: number };
 
-const FILTER_KEYS = ["q", "country", "city", "category", "hasEmail", "hasPhone", "hasWebsite", "contactStatus", "status", "job", "sort"];
+const FILTER_KEYS = ["q", "country", "city", "category", "hasEmail", "hasPhone", "hasWebsite", "contactStatus", "status", "job", "lane", "sort"];
 const select = "rounded-md border border-line bg-surface px-2 py-1.5 text-sm";
 
 export default function LeadsBrowser({ savedOnly = false }: { savedOnly?: boolean }) {
@@ -170,6 +170,15 @@ export default function LeadsBrowser({ savedOnly = false }: { savedOnly?: boolea
             <option value="phone">A phone</option>
             <option value="website">A website</option>
             <option value="nothing">No email or phone</option>
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-sm">
+          <span className="text-muted">Source</span>
+          {/* The two map sources are separate data lanes: never matched or merged. */}
+          <select value={v("lane")} onChange={(e) => setParams({ lane: e.target.value || null })} className={select}>
+            <option value="">All sources</option>
+            <option value="osm">OSM only</option>
+            <option value="overture">Overture only</option>
           </select>
         </label>
         <label className="flex flex-col gap-1 text-sm">

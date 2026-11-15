@@ -13,5 +13,6 @@ export type CategoryId = (typeof CATEGORIES)[number]["id"];
 export const CATEGORY_IDS = CATEGORIES.map((c) => c.id) as [CategoryId, ...CategoryId[]];
 
 // "google" = Google Places (New) for discovery/corroboration only; leads keep only OSM/website data.
-export const SOURCES = ["osm", "google"] as const;
+// "overture" = Overture Maps Places: a separate data lane, never matched with OpenStreetMap (M2).
+export const SOURCES = ["osm", "overture", "google"] as const;
 export type SourceId = (typeof SOURCES)[number];

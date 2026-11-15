@@ -2,7 +2,7 @@
 
 Signals, strongest first:
   provider ids (OSM id / Google place id)    -> exact, handled by unique indexes
-  phone (E.164) + nearby or similar name
+  phone (E.164) + nearby (a shared phone ALONE never merges: chains list one central number)
   normalized name + nearby (~150 m)
   website domain + very close / similar name  (domain ALONE never merges: chain branches share a domain)
   name + postcode/house number                (for records without coordinates)
@@ -120,6 +120,18 @@ def house_number(street: str | None) -> str:
     return m.group(1).lower() if m else ""
 
 
+def _phone_same_place(new: dict, old: dict, d: float | None, sim: float) -> bool:
+    """A shared phone number only proves the same place when the places are also in the same spot.
+    Chains list ONE head-office number for every branch: the GB pilot merged 139 "The Gym Group"
+    branches into one lead when a similar name was enough at any distance."""
+    if d is not None:
+        return d <= NEAR_M
+    # No coordinates on one side: only an (almost) identical name, and not a different postcode.
+    pa = normalize_postcode((new.get("address") or {}).get("postcode"))
+    pb = normalize_postcode((old.get("address") or {}).get("postcode"))
+    return sim >= 0.85 and not (pa and pb and pa != pb)
+
+
 def dedupe_key(name_normalized: str, latlon: tuple[float, float] | None) -> str | None:
     """Same name inside the same ~110 m grid cell. Backs a UNIQUE index, so two workers can't
     insert the same business at the same moment."""
@@ -135,7 +147,7 @@ def same_business(new: dict, old: dict) -> str | None:
     sim = name_similarity(new.get("name", ""), old.get("name", ""))
     same_name = new.get("nameNormalized") and new.get("nameNormalized") == old.get("nameNormalized")
 
-    if lead_phone_keys(new) & lead_phone_keys(old) and ((d is not None and d <= NEAR_M) or sim >= 0.6):
+    if lead_phone_keys(new) & lead_phone_keys(old) and _phone_same_place(new, old, d, sim):
         return "phone"
     if same_name and d is not None and d <= NEAR_M:
         return "name+distance"

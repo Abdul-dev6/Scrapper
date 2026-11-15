@@ -19,7 +19,9 @@ type FullLead = {
   phones?: ({ e164?: string; raw?: string; checks?: PhoneChecks } & Src)[];
   whatsapp?: ({ e164?: string; url?: string } & Src)[];
   socials?: Record<string, Social | undefined>;
-  externalIds?: { osm?: string; osmAliases?: string[]; googlePlaceId?: string };
+  externalIds?: { osm?: string; osmAliases?: string[]; overture?: string; googlePlaceId?: string };
+  dataLane?: string;
+  overture?: { release?: string; confidence?: number; sources?: { dataset?: string; license?: string }[] };
   verifiedAt?: string;
   contactStatus?: string;
   confidence?: number;
@@ -29,11 +31,16 @@ type FullLead = {
   discoveredAt?: string;
 };
 
-const SOURCE_LABEL: Record<string, string> = { osm: "OpenStreetMap", website: "website", google: "Google Maps" };
+const SOURCE_LABEL: Record<string, string> = {
+  osm: "OpenStreetMap", website: "website", google: "Google Maps", overture: "Overture Maps",
+};
 
 function Source({ s }: { s: Src }) {
   const href = safeHref(s.sourceUrl);
-  if (!href) return null;
+  if (!href) {
+    // Overture has no public page per place: show where it came from without a link.
+    return s.sourceType === "overture" ? <span className="ml-2 text-xs text-muted">source: Overture Maps</span> : null;
+  }
   return (
     <a href={href} target="_blank" rel="noopener noreferrer nofollow" className="ml-2 text-xs text-muted underline" title={href}>
       source: {SOURCE_LABEL[s.sourceType ?? ""] ?? "website"}
@@ -272,6 +279,27 @@ export default function LeadDrawer({ id, onClose, onChanged }: { id: string; onC
                 <p className="text-muted">None linked</p>
               )}
             </section>
+
+            {lead.dataLane === "overture" && (
+              <section className="space-y-1">
+                <p>
+                  From <span className="font-medium">Overture Maps</span> (release {lead.overture?.release ?? "?"}
+                  {lead.overture?.sources?.length
+                    ? `; sources: ${[...new Set(lead.overture.sources.map((s) => s.dataset).filter(Boolean))].join(", ")}`
+                    : ""}
+                  )
+                </p>
+                <p className="text-xs text-muted">
+                  Overture Maps Foundation, overturemaps.org ·{" "}
+                  {[...new Set((lead.overture?.sources ?? []).map((s) => s.license).filter(Boolean))].join(" / ") ||
+                    "CDLA-Permissive-2.0 / Apache-2.0"}
+                  {" "}· never matched with OpenStreetMap
+                </p>
+                {lead.verifiedAt && (
+                  <p className="text-xs text-muted">Contacts last checked {new Date(lead.verifiedAt).toLocaleDateString()}</p>
+                )}
+              </section>
+            )}
 
             {lead.externalIds?.osm && (
               <section className="space-y-1">

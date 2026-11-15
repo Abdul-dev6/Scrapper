@@ -49,8 +49,9 @@ def make_async_client(user_agent: str, timeout: float, transport: httpx.AsyncBas
     )
 
 
-def leads_to_crawl(db: Database, job: dict, settings: Settings) -> dict[str, list[dict]]:
-    """website url -> the job's leads with that url (skipping sites checked recently)."""
+def leads_to_crawl(db: Database, job: dict, settings: Settings) -> dict[tuple[str, str], list[dict]]:
+    """(data lane, website url) -> the job's leads with that url (skipping sites checked recently).
+    Grouped per lane too (licensing mode M2): an OSM lead and an Overture lead never share a result."""
     recent = q.now() - timedelta(days=settings.crawl_recheck_days)
     cursor = db.leads.find({
         "ownerId": job["ownerId"],
@@ -58,9 +59,9 @@ def leads_to_crawl(db: Database, job: dict, settings: Settings) -> dict[str, lis
         "website.url": {"$exists": True},
         "$or": [{"website.checkedAt": {"$exists": False}}, {"website.checkedAt": {"$lt": recent}}],
     })
-    groups: dict[str, list[dict]] = defaultdict(list)
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for lead in cursor:
-        groups[lead["website"]["url"]].append(lead)
+        groups[(lead.get("dataLane") or "osm", lead["website"]["url"])].append(lead)
     return dict(groups)
 
 
@@ -89,24 +90,25 @@ async def crawl_websites(
     async with make_async_client(user_agent, settings.crawl_timeout, transport, host_resolve) as client:
         fetcher = Fetcher(client, Robots(BOT_TOKEN), delay=settings.crawl_delay, sleep=sleep)
 
-        async def one(url: str) -> tuple[str, SiteResult | Exception]:
+        async def one(key: tuple[str, str]) -> tuple[tuple[str, str], SiteResult | Exception]:
             async with limit:
                 try:
-                    return url, await crawl_site(fetcher, url, max_pages=settings.crawl_max_pages)
+                    return key, await crawl_site(fetcher, key[1], max_pages=settings.crawl_max_pages)
                 except Exception as exc:  # a bug on one weird site must not stop the job
-                    return url, exc
+                    return key, exc
 
-        tasks = [asyncio.ensure_future(one(url)) for url in groups]
+        tasks = [asyncio.ensure_future(one(key)) for key in groups]
         try:
             for done, next_task in enumerate(asyncio.as_completed(tasks), 1):
-                url, result = await next_task
+                key, result = await next_task
+                url = key[1]
                 stats.checked += 1
                 if isinstance(result, Exception):
                     stats.failed += 1
                     q.log_error(db.scrapingJobs, job["_id"], "crawl", f"{type(result).__name__}: {result}", url=url)
                 else:
                     stats.reachable += result.reachable
-                    for lead in groups[url]:
+                    for lead in groups[key]:
                         await _save(db, lead, result, mx, hashes, stats)
                 on_progress(done, total, stats)
         finally:

@@ -104,6 +104,8 @@ def settings(tmp_path):
         crawl_concurrency=5, crawl_delay=0, crawl_max_pages=5, crawl_timeout=5, crawl_recheck_days=7,
         osm_cache_dir=str(tmp_path / "volume" / "osm"), osm_tmp_dir=str(tmp_path / "tmp"),
         osm_volume_margin_bytes=0, osm_tmp_margin_bytes=0, geofabrik_index_url=GEOFABRIK_INDEX,
+        overture_cache_dir=str(tmp_path / "volume" / "overture"), overture_stac_url=STAC,
+        overture_source=str(tmp_path / "overture").replace("\\", "/") + "/release/{release}/theme=places/type=place/*",
     )
 
 
@@ -129,6 +131,7 @@ def add_job(db, **over):
     return db.scrapingJobs.insert_one(doc).inserted_id
 
 
+STAC = "https://stac.test/catalog.json"  # Overture's release catalogue (tests serve "latest" from FakeOSM)
 GEOFABRIK = "https://geofabrik.test"
 GEOFABRIK_INDEX = f"{GEOFABRIK}/index-v1.json"
 TEST_REGION_BOX = [49.9, -8.0, 60.9, 1.8]  # [south, west, north, east]: the test "great-britain" region
@@ -196,6 +199,8 @@ class FakeOSM:
         self.wrong_length = wrong_length
         self.bodies = bodies or {}  # region id -> raw bytes (default: json of elements)
         self.bad_md5 = bad_md5  # publish a checksum that doesn't match (corrupted download)
+        self.overture_latest = "2026-10-21.0"  # what Overture's STAC catalogue calls "latest"
+        self.stac_status = None
         self.calls: list[httpx.Request] = []
 
     # --- what Geofabrik serves
@@ -219,6 +224,10 @@ class FakeOSM:
 
         self.calls.append(request)
         path = request.url.path
+        if request.url.host == "stac.test":
+            if self.stac_status:
+                return httpx.Response(self.stac_status)
+            return httpx.Response(200, json={"type": "Catalog", "id": "Overture Releases", "latest": self.overture_latest})
         if request.url.host != "geofabrik.test":
             return httpx.Response(599, text="unexpected host")
         if path == "/index-v1.json":

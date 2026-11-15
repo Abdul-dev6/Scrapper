@@ -28,6 +28,15 @@ class Settings:
     osm_max_download_bytes: int = 6 * 1024**3  # one extract
     osm_max_job_download_bytes: int = 8 * 1024**3  # everything one job may download
     geofabrik_index_url: str = "https://download.geofabrik.de/index-v1.json"
+    # Phase 2c: Overture Maps Places (separate "overture" lane; never matched with OSM).
+    overture_cache_dir: str = "/data/overture"  # same Railway Volume, own budget
+    overture_source: str = "s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
+    overture_stac_url: str = "https://stac.overturemaps.org/catalog.json"
+    overture_release: str = ""  # pin a release (e.g. 2026-10-21.0); empty = latest from the STAC catalogue
+    overture_cache_max_bytes: int = 512 * 1024**2
+    overture_min_confidence: float = 0.5
+    overture_duckdb_memory: str = "1GB"
+    overture_max_tiles_per_job: int = 400
     crawl_concurrency: int = 10  # websites crawled at the same time (each site still gets 1 request / delay)
     crawl_delay: float = 2.5  # seconds between two requests to the same website
     crawl_max_pages: int = 5  # pages per website: home + up to 4 contact/about pages
@@ -78,6 +87,14 @@ def load_settings() -> Settings:
         osm_max_download_bytes=num("OSM_MAX_DOWNLOAD_BYTES", d.osm_max_download_bytes),
         osm_max_job_download_bytes=num("OSM_MAX_JOB_DOWNLOAD_BYTES", d.osm_max_job_download_bytes),
         geofabrik_index_url=os.getenv("GEOFABRIK_INDEX_URL", d.geofabrik_index_url),
+        overture_cache_dir=os.getenv("OVERTURE_CACHE_DIR", d.overture_cache_dir),
+        overture_source=os.getenv("OVERTURE_SOURCE", d.overture_source),
+        overture_stac_url=os.getenv("OVERTURE_STAC_URL", d.overture_stac_url),
+        overture_release=os.getenv("OVERTURE_RELEASE", d.overture_release).strip(),
+        overture_cache_max_bytes=num("OVERTURE_CACHE_MAX_BYTES", d.overture_cache_max_bytes),
+        overture_min_confidence=num("OVERTURE_MIN_CONFIDENCE", d.overture_min_confidence, float),
+        overture_duckdb_memory=os.getenv("OVERTURE_DUCKDB_MEMORY", d.overture_duckdb_memory),
+        overture_max_tiles_per_job=num("OVERTURE_MAX_TILES_PER_JOB", d.overture_max_tiles_per_job),
         crawl_concurrency=num("CRAWL_CONCURRENCY", d.crawl_concurrency),
         crawl_delay=max(2.0, num("CRAWL_DELAY_SECONDS", d.crawl_delay, float)),  # never ruder than 2 s
         crawl_max_pages=min(5, num("CRAWL_MAX_PAGES", d.crawl_max_pages)),  # rule: max 5

@@ -19,6 +19,8 @@ const jobSchema = new Schema(
       // Phase 2b: the exact OpenStreetMap extract versions this job read (provider, region, version,
       // sha256, data date). Written by the worker; shown in job details.
       osmExtract: { type: Schema.Types.Mixed, default: undefined },
+      // Phase 2c: the Overture release + tiles this job read (provider, release, license).
+      overture: { type: Schema.Types.Mixed, default: undefined },
     },
     categories: [{ type: String, enum: CATEGORY_IDS, required: true }],
     sources: [{ type: String, enum: SOURCES, required: true }],
@@ -42,6 +44,8 @@ const jobSchema = new Schema(
       websitesChecked: { type: Number, default: 0 },
       websitesReachable: { type: Number, default: 0 },
       withEmail: { type: Number, default: 0 },
+      // Phase 2c: Overture lane counts (kept apart from the OSM counts above)
+      overture: { type: Schema.Types.Mixed, default: undefined },
     },
     // Step 6: Google Places report (mode, requests, places found, matched, Google-only...). Written by the worker.
     google: { type: Schema.Types.Mixed, default: undefined },
