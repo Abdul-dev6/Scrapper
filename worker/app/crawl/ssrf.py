@@ -11,9 +11,11 @@ hooks for redirects too):
   - every IP the hostname resolves to must be public (not private, loopback, link-local,
     reserved, multicast, unspecified, carrier-grade NAT, IPv4-mapped private...)
 
-Limitation: DNS could change between our check and httpx's own lookup (DNS rebinding). The
-window is milliseconds and the attacker would need to control a business's DNS; pinning the IP
-would break TLS hostname checks, so we accept it.
+DNS rebinding (security review M2, 2026-11-16): the request hook above resolves the name, but the
+connection used to resolve it AGAIN, so a hostile DNS server could answer "public" to the check and
+"10.0.0.5" to the connection. Now the connection itself is pinned: PinnedBackend resolves once, checks
+every address, and connects to exactly those checked IPs. TLS still verifies the certificate against the
+real host name (httpcore passes it as server_hostname), so HTTPS keeps working.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import ipaddress
 import socket
 from collections.abc import Awaitable, Callable
 
+import httpcore
 import httpx
 
 ALLOWED_PORTS = {80, 443, 8080, 8443}
@@ -88,3 +91,53 @@ def make_guard(resolve: HostResolve | None = None) -> Callable[[httpx.Request], 
             raise BlockedAddress("Website points to a private/internal address; not crawled")
 
     return guard
+
+
+class PinnedBackend(httpcore.AsyncNetworkBackend):
+    """Opens TCP connections ONLY to addresses checked in the same step (no second DNS lookup)."""
+
+    def __init__(self, resolve: HostResolve | None = None, inner: httpcore.AsyncNetworkBackend | None = None):
+        self.resolve = resolve
+        self.inner = inner or httpcore.AnyIOBackend()
+
+    async def connect_tcp(self, host: str, port: int, timeout: float | None = None, local_address: str | None = None,
+                          socket_options=None) -> httpcore.AsyncNetworkStream:
+        name = host.strip("[]").lower()
+        if port not in ALLOWED_PORTS:
+            raise BlockedAddress(f"Port {port} is not crawled")
+        try:
+            ips = [str(ipaddress.ip_address(name))]
+        except ValueError:
+            try:
+                ips = await (self.resolve or system_resolve)(name, port)
+            except (OSError, UnicodeError) as exc:
+                raise httpcore.ConnectError(f"Couldn't resolve {name}") from exc
+        if not ips or not all(ip_is_public(ip) for ip in ips):
+            raise BlockedAddress("Website points to a private/internal address; not crawled")
+        last: Exception | None = None
+        for ip in ips:  # all checked; try them in order like a normal client would
+            try:
+                return await self.inner.connect_tcp(ip, port, timeout=timeout, local_address=local_address,
+                                                    socket_options=socket_options)
+            except httpcore.ConnectError as exc:
+                last = exc
+        raise last or httpcore.ConnectError(f"Couldn't connect to {name}")
+
+    async def connect_unix_socket(self, path: str, timeout: float | None = None, socket_options=None):
+        raise BlockedAddress("Unix sockets are never used by the crawler")
+
+    async def sleep(self, seconds: float) -> None:
+        await self.inner.sleep(seconds)
+
+
+def pinned_transport(limits: httpx.Limits, resolve: HostResolve | None = None) -> httpx.AsyncHTTPTransport:
+    """httpx's normal transport, with the network layer swapped for PinnedBackend.
+
+    httpx has no public option for this, so the pool's backend attribute is replaced. The test
+    test_pinned_transport_is_wired fails loudly if a future httpx/httpcore renames it."""
+    transport = httpx.AsyncHTTPTransport(limits=limits, trust_env=False)
+    pool = transport._pool  # noqa: SLF001
+    if not hasattr(pool, "_network_backend"):
+        raise RuntimeError("httpcore changed: can't pin crawler connections (see ssrf.pinned_transport)")
+    pool._network_backend = PinnedBackend(resolve)  # noqa: SLF001
+    return transport

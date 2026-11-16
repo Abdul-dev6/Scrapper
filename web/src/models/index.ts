@@ -1,5 +1,6 @@
 export { User } from "./User";
 export { LoginAttempt } from "./LoginAttempt";
+export { JobStartLock } from "./JobStartLock";
 export { ScrapingJob, JOB_STATUSES } from "./ScrapingJob";
 export { Lead } from "./Lead";
 export { Suppression } from "./Suppression";

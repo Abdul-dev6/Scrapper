@@ -1,0 +1,17 @@
+# Keep secrets, local environments and caches out of the Docker build context (security review L9).
+# The Dockerfile only COPYs requirements.txt and app/, but everything not listed here is uploaded to
+# the builder (e.g. Railway) as build context.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+tests/
+scripts/
+data/
+*.pbf
+*.parquet
+*.log

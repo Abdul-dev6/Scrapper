@@ -57,6 +57,7 @@ const jobSchema = new Schema(
     cancelRequested: { type: Boolean, default: false },
     retryOf: { type: Schema.Types.ObjectId, ref: "ScrapingJob" }, // set when created by the Retry button
     workerId: String,
+    lease: String, // worker-only: random token of the current claim (a worker that lost the job can't write to it)
     lockedAt: Date, // heartbeat; a stale lock means the worker died and the job is re-queued
     attempts: { type: Number, default: 0 },
     // Worker-only: how far the job got (place, finished map pieces...), so a retry continues there.
@@ -71,6 +72,7 @@ const jobSchema = new Schema(
 
 jobSchema.index({ status: 1, createdAt: 1 }); // worker: oldest queued job first
 jobSchema.index({ ownerId: 1, createdAt: -1 }); // UI: job history
+jobSchema.index({ createdAt: -1 }); // global daily job cap (security review M3)
 jobSchema.index({ status: 1, lockedAt: 1 }); // worker: find stale running jobs
 
 export type ScrapingJobDoc = InferSchemaType<typeof jobSchema>;

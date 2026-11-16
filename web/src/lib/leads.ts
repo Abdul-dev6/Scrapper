@@ -1,3 +1,6 @@
+// Static import: a dynamic `await import("node:stream")` lost PassThrough in the production bundle
+// ("d is not a constructor" on Excel export; found in the staging run 2026-11-17).
+import { PassThrough } from "node:stream";
 import { Types, type FilterQuery } from "mongoose";
 import { z } from "zod";
 import { CATEGORY_IDS, CATEGORIES } from "./categories";
@@ -69,7 +72,9 @@ export function leadFilter(ownerId: Types.ObjectId, q: LeadQuery): FilterQuery<u
   if (q.job) f.jobIds = new Types.ObjectId(q.job);
   // Leads saved before Phase 2c have no dataLane: they are OpenStreetMap leads.
   if (q.lane === "overture") f.dataLane = "overture";
-  if (q.lane === "osm") f.dataLane = { $ne: "overture" };
+  // $in instead of $ne "overture": same rows (dataLane is "osm", "overture" or missing), but $in can
+  // use the {ownerId, dataLane, discoveredAt} index for the sort.
+  if (q.lane === "osm") f.dataLane = { $in: [null, "osm"] };
   if (and.length) f.$and = and;
   return f;
 }
@@ -228,21 +233,53 @@ export const EXPORT_ATTRIBUTION = [
   ["No Google Maps data (names, addresses, place IDs or other content) is included in this file."],
 ];
 
-/** The .xlsx file: a Leads sheet (plain strings, never formulas) and an attribution sheet. */
-export async function buildWorkbook(rows: string[][]): Promise<Uint8Array<ArrayBuffer>> {
+/**
+ * The only fields exportRow reads. A positive projection: the rest of a lead (mergeLog, Overture
+ * taxonomy, raw provenance...) is most of its size and would only cost memory (measured on 41,756
+ * leads: the full documents alone took ~340 MB of heap).
+ */
+export const EXPORT_FIELDS =
+  "name categories address website emails phones whatsapp socials externalIds.osm externalIds.overture dataLane " +
+  "overture.release overture.sources.license fieldSources verifiedAt contactStatus confidence status saved notes discoveredAt";
+
+/**
+ * The .xlsx file: a Leads sheet (plain strings, never formulas) and an attribution sheet.
+ * Written with exceljs' STREAMING writer, row by row: the in-memory Workbook model needed ~2.4 GB and
+ * 35 s for 41,756 rows (more than a serverless function has); streaming keeps memory flat.
+ */
+export async function buildWorkbook(rows: Iterable<string[]> | AsyncIterable<string[]>): Promise<Uint8Array<ArrayBuffer>> {
   const ExcelJS = (await import("exceljs")).default;
-  const wb = new ExcelJS.Workbook();
+  const out = new PassThrough();
+  const chunks: Buffer[] = [];
+  out.on("data", (c: Buffer) => chunks.push(c));
+  const ended = new Promise<void>((resolve, reject) => {
+    out.on("end", resolve);
+    out.on("error", reject);
+  });
+  // No shared strings / styles tables: both grow with every row and are what made the old file big in memory.
+  const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ stream: out, useSharedStrings: false, useStyles: true });
   wb.creator = "Lead Finder";
   const ws = wb.addWorksheet("Leads", { views: [{ state: "frozen", ySplit: 1 }] });
-  ws.addRow([...EXPORT_COLUMNS]).font = { bold: true };
-  // safeCell too, in case the file is re-saved as CSV.
-  for (const r of rows) ws.addRow(r.map(safeCell));
-  ws.columns.forEach((c) => (c.width = 22));
+  ws.columns = EXPORT_COLUMNS.map(() => ({ width: 22 }));
   ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: EXPORT_COLUMNS.length } };
+  const header = ws.addRow([...EXPORT_COLUMNS]);
+  header.font = { bold: true };
+  header.commit();
+  // safeCell too, in case the file is re-saved as CSV.
+  for await (const r of rows) ws.addRow(r.map(safeCell)).commit();
+  ws.commit();
   const about = wb.addWorksheet("About this data");
-  EXPORT_ATTRIBUTION.forEach((line, i) => (about.addRow(line).font = { bold: i === 0 }));
-  about.getColumn(1).width = 120;
-  return new Uint8Array(await wb.xlsx.writeBuffer());
+  about.columns = [{ width: 120 }];
+  EXPORT_ATTRIBUTION.forEach((line, i) => {
+    const row = about.addRow(line);
+    row.font = { bold: i === 0 };
+    row.commit();
+  });
+  about.commit();
+  await wb.commit();
+  await ended;
+  const buf = Buffer.concat(chunks);
+  return new Uint8Array(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
 }
 
 /**
@@ -254,11 +291,19 @@ export function safeCell(v: string): string {
   return /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
 }
 
+const csvCell = (v: string) => {
+  const s = safeCell(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+/** One CSV record (no line ending). */
+export const csvLine = (r: readonly string[]) => r.map(csvCell).join(",");
+
+/** Header + already-encoded lines. BOM so Excel opens UTF-8 (Urdu, Arabic, German...) correctly; CRLF per RFC 4180. */
+export function csvDocument(header: readonly string[], lines: string[]): string {
+  return "﻿" + [csvLine(header), ...lines].join("\r\n") + "\r\n";
+}
+
 export function toCsv(rows: string[][]): string {
-  const cell = (v: string) => {
-    const s = safeCell(v);
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  // BOM so Excel opens UTF-8 (names in Urdu, Arabic, German...) correctly; CRLF per RFC 4180.
-  return "﻿" + rows.map((r) => r.map(cell).join(",")).join("\r\n") + "\r\n";
+  return "﻿" + rows.map(csvLine).join("\r\n") + "\r\n";
 }

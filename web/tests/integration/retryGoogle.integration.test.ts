@@ -47,6 +47,8 @@ before(async () => {
   CREATE = (await import("../../src/app/api/jobs/route")).POST as unknown as typeof CREATE;
   ({ signSession } = await import("../../src/lib/session"));
   await (await import("../../src/lib/db")).connectDB();
+  // Sessions are only valid for users that exist (lib/auth.ts), so the test users exist.
+  await mongoose.connection.db!.collection("users").insertMany([{ _id: alice, email: `${alice}@test.test`, passwordHash: "x" }, { _id: mallory, email: `${mallory}@test.test`, passwordHash: "x" }] as never);
   await mongoose.connection.db!.collection("gazetteer").insertOne({
     _id: LEEDS, kind: "city", name: "Leeds", countryCode: "GB", lat: 53.79648, lon: -1.54785, population: 455123, keys: ["leeds"], ctxKeys: ["uk"],
   } as never);

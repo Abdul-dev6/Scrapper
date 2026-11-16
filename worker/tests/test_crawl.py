@@ -258,3 +258,26 @@ def test_fine_print_pages_are_not_followed():
     web = FakeWeb(pages={"https://gym.test/": html})
     run(_crawl(web, "https://gym.test/"))
     assert web.visited() == ["https://gym.test/", "https://gym.test/impressum"]
+
+
+def test_email_scan_is_linear_on_huge_pages_and_finds_the_same_addresses():
+    """The old unbounded pattern was quadratic on long letter runs: a 2 MB page (the fetch cap) took
+    minutes inside the crawler's event loop, stalling every other site and the job heartbeat."""
+    import random
+    import re
+    import time
+
+    from app.crawl.extract import emails_in_text
+
+    old = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}")
+    rng = random.Random(7)
+    for alphabet in ("abcXYZ09._%+- @@..\n", "ab@.c", "a@.", "x@ .-"):
+        for _ in range(2000):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 150)))
+            text += rng.choice(["", " info@gym.co.uk", " a.b+c@x-y.example.org.", " @@x.com", "mail:team@sub.dom.ain.io,"])
+            assert emails_in_text(text) == old.findall(text), text
+    for text, found in [("x" * 2_000_000 + " front@huge.test", ["front@huge.test"]), ("a@" * 1_000_000, []),
+                        (("x" * 63 + "@") * 30_000, []), ("q@w." * 500_000, [])]:
+        t0 = time.perf_counter()
+        assert emails_in_text(text) == found
+        assert time.perf_counter() - t0 < 10  # measured 0.001-2.8 s; the old scan did not finish in minutes

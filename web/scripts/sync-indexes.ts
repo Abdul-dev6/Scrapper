@@ -3,14 +3,14 @@
 import mongoose from "mongoose";
 import { connectDB } from "../src/lib/db";
 import {
-  User, LoginAttempt, ScrapingJob, Lead, Suppression, GeocodeCache, ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage,
+  User, LoginAttempt, JobStartLock, ScrapingJob, Lead, Suppression, GeocodeCache, ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage,
   Gazetteer, GazetteerMeta, OsmExtract, OvertureTile, OvertureRelease,
 } from "../src/models";
 
 async function main() {
   await connectDB();
   for (const m of [
-    User, LoginAttempt, ScrapingJob, Lead, Suppression, GeocodeCache, ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage,
+    User, LoginAttempt, JobStartLock, ScrapingJob, Lead, Suppression, GeocodeCache, ApiUsage, ApiUsageLog, GooglePlaceRef, GoogleCoverage,
     Gazetteer, GazetteerMeta, OsmExtract, OvertureTile, OvertureRelease,
   ] as const) {
     await m.createCollection().catch(() => {}); // already exists → fine

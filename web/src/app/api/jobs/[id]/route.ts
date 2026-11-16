@@ -18,7 +18,7 @@ export async function GET(_req: Request, { params }: Ctx) {
 
     await connectDB();
     // ownerId in the filter: another user's job id simply "doesn't exist" for you.
-    const job = await ScrapingJob.findOne({ _id: id.data, ownerId: user.id }).select("-workerId -ownerId -checkpoint").lean();
+    const job = await ScrapingJob.findOne({ _id: id.data, ownerId: user.id }).select("-workerId -ownerId -checkpoint -lease").lean();
     if (!job) return jsonError(404, "Job not found");
     const errorLog = [...(job.errorLog ?? [])].reverse().slice(0, 50);
     // Places Google returned for this job. Only the place ID is stored (Google allows that) and it is

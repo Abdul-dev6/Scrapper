@@ -4,6 +4,21 @@ from urllib.parse import parse_qs
 
 import httpx
 import mongomock
+import mongomock.collection
+
+# pymongo >= 4.18 (upgraded for security advisories, 2026-11-16) passes `sort=` to bulk update builders;
+# mongomock 4.3.0 (the latest release) doesn't accept it yet. Tests only: drop it when unused, and fail
+# loudly if a test ever needs it (so nothing is silently ignored). Real MongoDB is not affected.
+_add_update = mongomock.collection.BulkOperationBuilder.add_update
+
+
+def _add_update_compat(self, *args, sort=None, **kwargs):
+    if sort is not None:
+        raise NotImplementedError("mongomock can't emulate update sort=; use a real MongoDB test")
+    return _add_update(self, *args, **kwargs)
+
+
+mongomock.collection.BulkOperationBuilder.add_update = _add_update_compat
 import pytest
 from bson import ObjectId
 

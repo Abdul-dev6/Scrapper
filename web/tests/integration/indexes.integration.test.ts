@@ -37,6 +37,11 @@ test("all indexes build, including osmExtracts and gazetteer", async () => {
   assert.ok(names.leads.includes("ownerId_1_externalIds.osm_1")); // existing lead indexes unchanged
   assert.ok(names.leads.includes("ownerId_1_dedupeKey_1"));
   assert.ok(names.leads.includes("ownerId_1_externalIds.overture_1")); // one lead per Overture place per user
-  assert.ok(names.leads.includes("ownerId_1_dataLane_1_discoveredAt_-1")); // the Source filter
+  assert.ok(names.leads.includes("ownerId_1_dataLane_1_discoveredAt_-1__id_-1")); // the Source filter, newest first
+  // Phase 3: one index per table sort, so a page never sorts all of a user's leads in memory
+  for (const n of ["ownerId_1_discoveredAt_-1__id_-1", "ownerId_1_nameNormalized_1__id_1", "ownerId_1_confidence_-1__id_-1"]) {
+    assert.ok(names.leads.includes(n), n);
+  }
+  assert.ok(!names.leads.includes("ownerId_1_nameNormalized_1")); // replaced by the 3-field index (same prefix)
   assert.ok(names.overtureTiles.includes("status_1_lastAccessAt_1"));
 });

@@ -2,6 +2,7 @@ import PageHeader from "@/components/PageHeader";
 import { requireUserPage } from "@/lib/auth";
 import OptOutList from "./opt-out-list";
 import PasswordForm from "./password-form";
+import SignOutEverywhere from "./sign-out-everywhere";
 
 export default async function Page() {
   const user = await requireUserPage();
@@ -13,6 +14,7 @@ export default async function Page() {
           <h2 className="mb-1 text-lg font-semibold">Account</h2>
           <p className="text-sm text-muted">Signed in as {user.email}</p>
           <PasswordForm />
+          <SignOutEverywhere />
         </section>
         <section className="rounded-lg border border-line bg-surface p-6">
           <h2 className="mb-1 text-lg font-semibold">Opt-out list</h2>

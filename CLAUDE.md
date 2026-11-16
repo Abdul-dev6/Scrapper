@@ -22,6 +22,9 @@ Flow: user enters a location + categories → worker discovers businesses
 ## Locked decisions (do not change without asking)
 
 - Multi-user with open sign-up (/signup, max 5 accounts per IP per hour; decided 2026-11-09).
+  Confirmed 2026-11-16 (security review M3 = C): sign-up stays open, with abuse/cost caps: per user
+  3 open / 10 per hour / 30 per 24 h / 3 whole-country per 24 h; all users 20 open / 300 per 24 h;
+  sign-ups 5 per IP + 50 in total per hour; exports 10 per user per hour (env-overridable, web/.env.example).
   Every document has `ownerId` and every query filters by it, so users never see each other's data.
 - Discovery: offline gazetteer + Natural Earth areas (Phase 2a) and Geofabrik extracts (Phase 2b).
   No public Nominatim and no public Overpass in production (decided 2026-11-14/15).
@@ -77,7 +80,7 @@ a new concept. Explain WHY a solution works, not only what changed.
 2. ✅ OSM discovery: Nominatim + Overpass → save businesses as leads (done)
 3. ✅ Website crawler, extraction (JSON-LD first), verification, dedupe/merge (done)
 4. ✅ Live job progress polish, cancel/retry endpoints (done)
-5. Leads tables, search/filters, CSV/Excel export, saved leads, opt-out list, settings
+5. ✅ Leads tables, search/filters, CSV/Excel export, saved leads, opt-out list, settings (done)
 6. 🟡 Google Places (refs only), fuzzy dedupe, SSRF guard, usage limits (done); security review, deploy
 7. ✅ Phase 1 (2026-11-14): contact check statuses + manual verification, migration (4,795 leads),
    job checkpoints/resume, exponential backoff, crawler retry, Google off + no matching/export.
@@ -91,3 +94,9 @@ a new concept. Explain WHY a solution works, not only what changed.
 10. ✅ Phase 2c (same branch): Overture Places via DuckDB over S3 GeoParquet, "overture" lane (`dataLane`),
    per-release 1° tile cache (/data/overture, `overtureTiles`), GERS IDs + aliases + provenance, Source
    filter, source-aware exports. Never matched with OSM. Leads without `dataLane` are OSM.
+11. ✅ Phase 3 (same branch, local only): end-to-end tests with real data (`worker/scripts/e2e_local.py`),
+   job lease fencing (`scrapingJobs.lease`) + SIGTERM hand-back, progress/checkpoints also on skipped rows,
+   Overture pin renewal once a minute, lead sort indexes, streaming export, per-network login cap,
+   authorization sweep over every API route (`web/tests/integration/authz.integration.test.ts`),
+   per-user job-start lock (`jobStartLocks`), session invalidation on password change (`users.sessionVersion`),
+   linear email scan, crawl test against a real local HTTP server.

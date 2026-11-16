@@ -11,7 +11,7 @@ from .db import connect
 from .google.merge import purge_expired_locations
 from .osm.extracts import BackgroundRefresher, ExtractConfig, check_writable
 from .overture.places import OvertureConfig, TileCache
-from .pipeline import JobCancelled, is_transient, run_job
+from .pipeline import JobCancelled, WorkerStopping, is_transient, run_job
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("worker")
@@ -25,27 +25,44 @@ def _request_stop(signum, _frame):
     log.info("Received signal %s, finishing current step then exiting", signum)
 
 
-def process(db, job, settings) -> None:
+def stopping() -> bool:
+    return _stop
+
+
+def process(db, job, settings, *, stop=stopping) -> None:
     jobs = db.scrapingJobs
     job_id = job["_id"]
+    lease = job.get("lease")  # every state change below is fenced: a job taken over by another worker is left alone
     log.info("Claimed job %s (%s, attempt %s)", job_id, job["location"]["query"], job.get("attempts"))
     try:
-        status = run_job(db, job, settings)
-        q.finish(jobs, job_id, status)
-        log.info("Job %s finished: %s", job_id, status)
+        status = run_job(db, job, settings, stop=stop)
+        if q.finish(jobs, job_id, status, lease=lease):
+            log.info("Job %s finished: %s", job_id, status)
+        else:
+            log.warning("Job %s finished here, but another worker owns it now; left unchanged", job_id)
     except JobCancelled:
-        q.finish(jobs, job_id, "cancelled")
+        q.finish(jobs, job_id, "cancelled", lease=lease)
         log.info("Job %s cancelled", job_id)
+    except WorkerStopping:
+        handed_back = q.release_for_restart(jobs, job_id, lease=lease)
+        log.info("Worker stopping: job %s %s", job_id,
+                 "handed back (continues from its checkpoint)" if handed_back else "was no longer ours")
+    except q.LeaseLost as exc:
+        # This worker was paused/too slow and the job was re-queued (maybe running elsewhere now): stop
+        # quietly. Writing anything (failed/cancelled/error log) would corrupt the new owner's job.
+        log.warning("Job %s: %s. Stopped working on it.", job_id, exc)
     except Exception as exc:  # one bad job must never kill the worker
         if is_transient(exc):
             # Busy map server, network or database hiccup: try again later from the checkpoint.
-            q.log_error(jobs, job_id, "pipeline", f"{type(exc).__name__}: {exc}")
             outcome = q.retry_later(jobs, job_id, attempts=job.get("attempts", 1),
-                                    max_attempts=getattr(settings, "max_attempts", 3), message=str(exc)[:150])
+                                    max_attempts=getattr(settings, "max_attempts", 3), message=str(exc)[:150],
+                                    lease=lease)
+            if outcome != "lost":  # a job another worker owns now gets nothing from this attempt
+                q.log_error(jobs, job_id, "pipeline", f"{type(exc).__name__}: {exc}")
             log.warning("Job %s hit a temporary problem (%s): %s", job_id, exc, outcome)
             return
-        q.log_error(jobs, job_id, "pipeline", f"{type(exc).__name__}: {exc}")
-        q.finish(jobs, job_id, "failed", stage=str(exc)[:200])
+        if q.finish(jobs, job_id, "failed", stage=str(exc)[:200], lease=lease):
+            q.log_error(jobs, job_id, "pipeline", f"{type(exc).__name__}: {exc}")
         log.error("Job %s failed\n%s", job_id, traceback.format_exc())
 
 

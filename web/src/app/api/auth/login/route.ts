@@ -1,14 +1,19 @@
-import { createHash } from "node:crypto";
 import bcrypt from "bcryptjs";
 import { NextResponse, type NextRequest } from "next/server";
 import { connectDB } from "@/lib/db";
 import { clientIp, jsonError, readJsonBody, serverError, zodError } from "@/lib/http";
-import { SESSION_COOKIE, SESSION_TTL_SECONDS, signSession } from "@/lib/session";
+import { clear, counterKey, hit, release } from "@/lib/rateLimit";
+import { sessionCookie, signSession } from "@/lib/session";
 import { loginSchema } from "@/lib/validators";
-import { LoginAttempt, User } from "@/models";
+import { User } from "@/models";
 
-const MAX_FAILURES = 5;
 const LOCK_MINUTES = 15;
+const MAX_FAILURES = 5; // per network + email: typos from one place
+// Per network: one IP trying a common password on many accounts. Generous for shared offices/NAT.
+const MAX_IP_FAILURES = 50;
+// Per account, from ANY network (security review M4): credential stuffing from many IPs. Higher than the
+// per-network limit so an attacker can't lock a real user out quite as easily.
+const MAX_EMAIL_FAILURES = 20;
 // Compared against when the email doesn't exist, so response time doesn't reveal valid emails.
 const DUMMY_HASH = "$2a$12$RTnPHn4H9CtMmuoYNtr3vONzvatMoX5uvTx46oqAuKrJ0ZCcBeOLC";
 
@@ -21,34 +26,28 @@ export async function POST(req: NextRequest) {
     const { email, password } = parsed.data;
 
     await connectDB();
-    const key = createHash("sha256").update(`${clientIp(req)}|${email}`).digest("hex");
-    const attempt = await LoginAttempt.findOne({ key }).lean();
-    if (attempt && attempt.count >= MAX_FAILURES) {
+    const ip = clientIp(req);
+    const keys = {
+      ipEmail: counterKey(ip, email),
+      ip: counterKey("login-ip", ip),
+      email: counterKey("login-email", email),
+    };
+    // Every attempt is counted BEFORE the password is checked, atomically. A success gives it back.
+    const [n, nIp, nEmail] = await Promise.all([
+      hit(keys.ipEmail, LOCK_MINUTES), hit(keys.ip, LOCK_MINUTES), hit(keys.email, LOCK_MINUTES),
+    ]);
+    if (n > MAX_FAILURES || nIp > MAX_IP_FAILURES || nEmail > MAX_EMAIL_FAILURES) {
       return jsonError(429, `Too many failed attempts. Try again in ${LOCK_MINUTES} minutes.`);
     }
 
     const user = await User.findOne({ email }).select("+passwordHash").lean();
     const ok = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+    if (!user || !ok) return jsonError(401, "Email or password is incorrect.");
 
-    if (!user || !ok) {
-      await LoginAttempt.updateOne(
-        { key },
-        { $inc: { count: 1 }, $setOnInsert: { expiresAt: new Date(Date.now() + LOCK_MINUTES * 60_000) } },
-        { upsert: true }
-      );
-      return jsonError(401, "Email or password is incorrect.");
-    }
-
-    await LoginAttempt.deleteOne({ key });
-    const token = await signSession({ sub: String(user._id), email: user.email });
+    await Promise.all([clear(keys.ipEmail), release(keys.ip), release(keys.email)]);
+    const token = await signSession({ sub: String(user._id), email: user.email, ver: user.sessionVersion ?? 0 });
     const res = NextResponse.json({ ok: true });
-    res.cookies.set(SESSION_COOKIE, token, {
-      httpOnly: true, // JS can't read it → XSS can't steal the session
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax", // blocks cross-site POSTs (CSRF) while allowing normal navigation
-      path: "/",
-      maxAge: SESSION_TTL_SECONDS,
-    });
+    res.cookies.set(sessionCookie(token));
     return res;
   } catch (err) {
     return serverError(err);

@@ -19,7 +19,32 @@ from bs4 import BeautifulSoup
 
 from ..osm.mapping import host_of, registrable_domain
 
-EMAIL_IN_TEXT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,24}")
+# Bounded like real addresses (RFC 5321: local part <= 64, labels <= 63, domain <= 253). Unbounded `+`
+# made findall QUADRATIC on long letter runs without "@" (base64 blobs, minified text): a 2 MB page
+# took minutes inside the crawler's event loop, stalling every other site and the job heartbeat.
+EMAIL_IN_TEXT = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}")
+_BEFORE_AT, _AFTER_AT = 64, 9 * 64 + 25  # the longest possible match on each side of "@"
+_LOCAL_TAIL = re.compile(r"[A-Za-z0-9._%+-]{1,64}\Z")  # used with endpos = the "@"
+
+
+def emails_in_text(text: str) -> list[str]:
+    """EMAIL_IN_TEXT.findall(text), but only looking near each "@" (linear in the text length)."""
+    out: list[str] = []
+    end = 0  # matches never overlap: continue after the previous one
+    for at in (m.start() for m in re.finditer("@", text)):
+        if at < end:
+            continue
+        # The local part is the run of address characters right before this "@" (at most 64 of them):
+        # one anchored match from where that run starts. The part after "@" doesn't depend on where the
+        # local part starts, so this is the match findall would find (leftmost start).
+        local = _LOCAL_TAIL.search(text, max(end, at - _BEFORE_AT), at)
+        if local is None:
+            continue
+        m = EMAIL_IN_TEXT.match(text, local.start(), min(len(text), at + _AFTER_AT))
+        if m:
+            out.append(m.group())
+            end = m.end()
+    return out
 
 SOCIAL_SITES = {
     "instagram": ("instagram.com",),
@@ -158,7 +183,7 @@ def extract(html: str, page_url: str) -> Found:
     # 3. Emails written in the visible text (scripts and styles removed first)
     for tag in soup(["script", "style", "noscript", "template"]):
         tag.decompose()
-    for match in EMAIL_IN_TEXT.findall(soup.get_text(" ")):
+    for match in emails_in_text(soup.get_text(" ")):
         found.add("emails", match)
 
     return found

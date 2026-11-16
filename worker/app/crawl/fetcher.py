@@ -20,6 +20,8 @@ from .ssrf import BlockedAddress
 
 MAX_PAGE_BYTES = 2_000_000
 MAX_CRAWL_DELAY = 30.0  # a site asking for more than this is waited on at most 30 s
+PAGE_DEADLINE = 30.0  # seconds for one whole page: redirects + headers + body
+MAX_REDIRECTS = 5
 
 
 class FetchError(Exception):
@@ -109,37 +111,56 @@ class Fetcher:
                 raise FetchError(str(exc)) from None
 
     async def _fetch_locked(self, url: str, host: str, origin: str) -> Page:
-        if not await self.robots.allowed(self.client, origin, url):
-            raise FetchError("Blocked by robots.txt")
-        await self._wait_turn(host, origin)
-        try:
-            async with self.client.stream("GET", url) as resp:
-                if resp.status_code in RETRY_STATUS:
-                    raise RetryableFetch(f"HTTP {resp.status_code}", _retry_after(resp.headers.get("retry-after")))
-                if resp.status_code >= 400:
-                    raise FetchError(f"HTTP {resp.status_code}")
-                ctype = resp.headers.get("content-type", "").lower()
-                if ctype and "html" not in ctype:
-                    raise FetchError("Not an HTML page")
-                body = bytearray()
-                async for chunk in resp.aiter_bytes():
-                    body += chunk
-                    if len(body) > MAX_PAGE_BYTES:
-                        break
-                final_url = str(resp.url)
-                encoding = resp.encoding or "utf-8"
-        except BlockedAddress:
-            raise
-        except FetchError:
-            raise
-        except httpx.TimeoutException as exc:
-            raise RetryableFetch("The website took too long to answer") from exc
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
-            raise RetryableFetch("Couldn't connect to the website") from exc
-        except httpx.HTTPError as exc:
-            raise FetchError("Couldn't connect to the website") from exc
-        if final_url != url and origin_of(final_url) != origin:
-            # Redirected to another site: check that site's robots.txt too.
-            if not await self.robots.allowed(self.client, origin_of(final_url), final_url):
+        return await self._follow(url, host, origin)
+
+    async def _follow(self, url: str, host: str, origin: str) -> Page:
+        """Redirects are followed here, one hop at a time, so robots.txt is checked for EVERY page we
+        request, including the pages in between (security review L10). The SSRF hook still runs per hop."""
+        current = url
+        for _hop in range(MAX_REDIRECTS + 1):
+            cur_origin = origin_of(current)
+            if not await self.robots.allowed(self.client, cur_origin, current):
                 raise FetchError("Blocked by robots.txt")
-        return Page(final_url, bytes(body).decode(encoding, errors="replace"))
+            if cur_origin == origin:
+                await self._wait_turn(host, origin)
+            redirect: str | None = None
+            try:
+                # Each request + its body within PAGE_DEADLINE: per-read timeouts alone let a site that sends
+                # one byte every few seconds hold a crawl slot for hours (security review L6). Only the network
+                # part: the polite waits above (Crawl-delay up to 30 s, robots.txt) must not count against it.
+                async with asyncio.timeout(PAGE_DEADLINE):
+                    async with self.client.stream("GET", current, follow_redirects=False) as resp:
+                        if resp.is_redirect and resp.headers.get("location"):
+                            redirect = str(resp.url.join(resp.headers["location"]))
+                        else:
+                            return await self._read(resp)
+            except TimeoutError:
+                raise FetchError("The website was too slow to send the page") from None
+            except (BlockedAddress, FetchError):
+                raise
+            except httpx.TimeoutException as exc:
+                raise RetryableFetch("The website took too long to answer") from exc
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                raise RetryableFetch("Couldn't connect to the website") from exc
+            except httpx.HTTPError as exc:
+                raise FetchError("Couldn't connect to the website") from exc
+            if urlsplit(redirect).scheme not in ("http", "https"):
+                raise FetchError("Redirected to a non-web address")
+            current = redirect
+        raise FetchError("Too many redirects")
+
+    async def _read(self, resp: httpx.Response) -> Page:
+        if resp.status_code in RETRY_STATUS:
+            raise RetryableFetch(f"HTTP {resp.status_code}", _retry_after(resp.headers.get("retry-after")))
+        if resp.status_code >= 400:
+            raise FetchError(f"HTTP {resp.status_code}")
+        ctype = resp.headers.get("content-type", "").lower()
+        if ctype and "html" not in ctype:
+            raise FetchError("Not an HTML page")
+        body = bytearray()
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) > MAX_PAGE_BYTES:
+                break
+        encoding = resp.encoding or "utf-8"
+        return Page(str(resp.url), bytes(body[:MAX_PAGE_BYTES]).decode(encoding, errors="replace"))

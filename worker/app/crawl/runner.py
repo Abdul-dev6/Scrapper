@@ -22,7 +22,7 @@ from .enrich import as_lead, build_update
 from .fetcher import Fetcher
 from .robots import Robots
 from .site import SiteResult, crawl_site
-from .ssrf import HostResolve, make_guard
+from .ssrf import HostResolve, make_guard, pinned_transport
 from .verify import MxChecker, Resolve, dns_has_mx
 
 BOT_TOKEN = "LeadFinderBot"  # the name robots.txt rules are matched against
@@ -38,14 +38,18 @@ class CrawlStats:
 
 def make_async_client(user_agent: str, timeout: float, transport: httpx.AsyncBaseTransport | None = None,
                       host_resolve: HostResolve | None = None):
+    limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
     return httpx.AsyncClient(
-        transport=transport,
+        # Real network: connections are pinned to the checked IPs (DNS rebinding, review M2).
+        # Tests pass their own (mock / local) transport.
+        transport=transport or pinned_transport(limits, host_resolve),
+        trust_env=False,  # a proxy from the environment would bypass the pinned connections
         event_hooks={"request": [make_guard(host_resolve)]},  # SSRF check on every request + redirect hop
         headers={"User-Agent": user_agent, "Accept": "text/html,application/xhtml+xml"},
         timeout=httpx.Timeout(timeout),
         follow_redirects=True,
         max_redirects=5,
-        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        limits=limits,
     )
 
 

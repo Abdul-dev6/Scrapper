@@ -93,8 +93,8 @@ def _crash_at_osm_checkpoint(monkeypatch, n):
     real_save = q.save_checkpoint
     saves = []
 
-    def crash(jobs, job_id, key, value):
-        real_save(jobs, job_id, key, value)
+    def crash(jobs, job_id, key, value, **kw):
+        real_save(jobs, job_id, key, value, **kw)
         if key == "osm" and value.get("position"):
             saves.append(value["position"])
             if len(saves) == n:
@@ -129,17 +129,19 @@ def test_crashed_job_resumes_from_checkpoint_with_the_same_extract_version(db, s
     fake = FakeOSM(elements=GYMS)
     add_job(db)
     job = q.claim_next_job(db.scrapingJobs, "w1")
-    real_save = _crash_at_osm_checkpoint(monkeypatch, 2)  # after element 50 of 60
+    # The 2nd mid-file checkpoint is written when element 50 of 60 comes up, before it is handled
+    # ("continue at element 50"): 49 leads are saved.
+    real_save = _crash_at_osm_checkpoint(monkeypatch, 2)
     with pytest.raises(Crash):
         _run(db, settings, fake, job)
-    assert db.leads.count_documents({}) == 50
+    assert db.leads.count_documents({}) == 49
     pinned = db.scrapingJobs.find_one({"_id": job["_id"]})["checkpoint"]["osm"]["extracts"][0]
     monkeypatch.setattr(q, "save_checkpoint", real_save)
 
     processed = _count_processed(monkeypatch)
     job = _restart(db, job["_id"])
     assert _run(db, settings, fake, job) == "completed"
-    assert processed == [f"node/{i}" for i in range(51, 61)]  # only the 10 elements not done before
+    assert processed == [f"node/{i}" for i in range(50, 61)]  # only the 11 elements not done before
     assert len(fake.downloads()) == 1  # the extract wasn't downloaded again
     done = db.scrapingJobs.find_one({"_id": job["_id"]})
     assert db.leads.count_documents({}) == 60 and done["stats"]["newLeads"] == 60  # nothing twice, counts continued
@@ -152,7 +154,7 @@ def test_a_new_extract_published_meanwhile_is_not_mixed_into_a_running_job(db, s
     fake = FakeOSM(elements=GYMS)
     add_job(db)
     job = q.claim_next_job(db.scrapingJobs, "w1")
-    real_save = _crash_at_osm_checkpoint(monkeypatch, 1)  # after element 25
+    real_save = _crash_at_osm_checkpoint(monkeypatch, 1)  # checkpoint "continue at element 25"
     with pytest.raises(Crash):
         _run(db, settings, fake, job)
     monkeypatch.setattr(q, "save_checkpoint", real_save)
@@ -171,7 +173,7 @@ def test_a_new_extract_published_meanwhile_is_not_mixed_into_a_running_job(db, s
     processed = _count_processed(monkeypatch)
     job = _restart(db, job["_id"])
     _run(db, settings, fake, job)
-    assert "node/999" not in processed and processed[0] == "node/26"  # finished on the version it started with
+    assert "node/999" not in processed and processed[0] == "node/25"  # finished on the version it started with
     done = db.scrapingJobs.find_one({"_id": job["_id"]})
     assert done["location"]["osmExtract"]["extracts"][0]["sha256"] == old_sha
 

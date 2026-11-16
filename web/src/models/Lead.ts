@@ -139,7 +139,7 @@ leadSchema.index(
 );
 leadSchema.index({ ownerId: 1, "externalIds.overtureAliases": 1 });
 leadSchema.index({ ownerId: 1, "externalIds.overtureSources": 1 });
-leadSchema.index({ ownerId: 1, dataLane: 1, discoveredAt: -1 }); // the Source filter
+leadSchema.index({ ownerId: 1, dataLane: 1, discoveredAt: -1, _id: -1 }); // the Source filter, newest first
 // One lead per Google place, per user.
 leadSchema.index(
   { ownerId: 1, "externalIds.googlePlaceId": 1 },
@@ -148,7 +148,11 @@ leadSchema.index(
 leadSchema.index({ ownerId: 1, dedupeKey: 1 }, { unique: true, partialFilterExpression: { dedupeKey: { $type: "string" } } });
 // Duplicate lookups by the worker (same phone / same name under another id)
 leadSchema.index({ ownerId: 1, "phones.e164": 1 });
-leadSchema.index({ ownerId: 1, nameNormalized: 1 });
+leadSchema.index({ ownerId: 1, nameNormalized: 1, _id: 1 }); // also the table's "name" sort
+// The leads table's sorts (lib/leads.ts SORTS). Without them every page sorted ALL of the user's leads
+// in memory (measured: 41,756 leads, 1.4-2.2 s per page on a local server).
+leadSchema.index({ ownerId: 1, discoveredAt: -1, _id: -1 });
+leadSchema.index({ ownerId: 1, confidence: -1, _id: -1 });
 // Filters used by the leads table
 leadSchema.index({ ownerId: 1, "address.countryCode": 1, "address.city": 1 });
 leadSchema.index({ ownerId: 1, categories: 1 });

@@ -3,7 +3,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { connectDB } from "@/lib/db";
 import { jsonError, serverError, zodError, readJsonBody } from "@/lib/http";
 import { createJobSchema } from "@/lib/validators";
-import { JOB_LIST_FIELDS, jobLimitError } from "@/lib/jobs";
+import { JOB_LIST_FIELDS, startJobLimited } from "@/lib/jobs";
 import { placeForJob } from "@/lib/places";
 import { ScrapingJob } from "@/models";
 
@@ -38,18 +38,22 @@ export async function POST(req: NextRequest) {
     const { location, placeId, categories, sources } = parsed.data;
 
     await connectDB();
-    const limit = await jobLimitError(user.id);
-    if (limit) return jsonError(429, limit);
     // The exact place the user picked; the worker builds the search area from this copy.
     const place = await placeForJob(placeId);
     if (!place) return jsonError(400, "That place wasn't found. Search again and pick it from the list.");
 
-    const job = await ScrapingJob.create({
-      ownerId: user.id,
-      location: { query: location, place },
-      categories: [...new Set(categories)],
-      sources: [...new Set(sources)],
-    });
+    // Limits + insert under the user's lock: simultaneous requests can't all pass the same count.
+    const started = await startJobLimited(user.id, () =>
+      ScrapingJob.create({
+        ownerId: user.id,
+        location: { query: location, place },
+        categories: [...new Set(categories)],
+        sources: [...new Set(sources)],
+      }),
+      place
+    );
+    if ("error" in started) return jsonError(429, started.error);
+    const job = started.value;
     return NextResponse.json({ job: { _id: job._id, status: job.status } }, { status: 201 });
   } catch (err) {
     return serverError(err);

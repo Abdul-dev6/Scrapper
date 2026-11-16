@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { connectDB } from "@/lib/db";
 import { jsonError, serverError } from "@/lib/http";
-import { jobLimitError } from "@/lib/jobs";
+import { startJobLimited } from "@/lib/jobs";
 import { objectIdSchema } from "@/lib/validators";
 import { ScrapingJob } from "@/models";
 
@@ -38,21 +38,24 @@ export async function POST(_req: Request, { params }: Ctx) {
     if (!old.location.place) {
       return jsonError(409, "This search was created before place selection. Start a new search and pick the place from the list.");
     }
-    const limit = await jobLimitError(user.id);
-    if (limit) return jsonError(429, limit);
-
     // Google is never carried over by Retry (decision 2026-11-14): an old job's Google choice may
     // predate the current rules or quota. Google needs a NEW search where the user ticks it again.
     // The worker also refuses Google for any job with `retryOf` (defense in depth).
     const sources = retrySources(old.sources);
     const googleRemoved = (old.sources ?? []).includes("google");
-    const job = await ScrapingJob.create({
-      ownerId: user.id,
-      location: { query: old.location.query, place: old.location.place },
-      categories: old.categories,
-      sources,
-      retryOf: old._id,
-    });
+    const { query, place } = old.location;
+    const started = await startJobLimited(user.id, () =>
+      ScrapingJob.create({
+        ownerId: user.id,
+        location: { query, place },
+        categories: old.categories,
+        sources,
+        retryOf: old._id,
+      }),
+      place
+    );
+    if ("error" in started) return jsonError(429, started.error);
+    const job = started.value;
     return NextResponse.json({ job: { _id: job._id, status: job.status, sources }, googleRemoved }, { status: 201 });
   } catch (err) {
     return serverError(err);

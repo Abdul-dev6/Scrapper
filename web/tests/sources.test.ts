@@ -14,7 +14,7 @@ const q = (s: string) => {
 
 test("source filter: all / OSM only (incl. leads from before Phase 2c) / Overture only", () => {
   assert.equal(leadFilter(owner, q("")).dataLane, undefined);
-  assert.deepEqual(leadFilter(owner, q("lane=osm")).dataLane, { $ne: "overture" }); // missing dataLane = OSM
+  assert.deepEqual(leadFilter(owner, q("lane=osm")).dataLane, { $in: [null, "osm"] }); // missing dataLane = OSM
   assert.equal(leadFilter(owner, q("lane=overture")).dataLane, "overture");
   assert.equal(leadFilter(owner, q("lane=overture")).ownerId, owner); // still scoped to the user
   assert.ok(!parseLeadQuery(new URLSearchParams("lane=google")).success);

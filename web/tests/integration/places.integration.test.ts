@@ -51,6 +51,8 @@ before(async () => {
   RETRY = wrap((await import("../../src/app/api/jobs/[id]/retry/route")).POST);
   ({ signSession } = await import("../../src/lib/session"));
   await (await import("../../src/lib/db")).connectDB();
+  // Sessions are only valid for users that exist (lib/auth.ts), so the test users exist.
+  await mongoose.connection.db!.collection("users").insertMany([{ _id: alice, email: `${alice}@test.test`, passwordHash: "x" }] as never);
   await db().collection("gazetteer").insertMany(GAZ as never);
   await db().collection("gazetteerMeta").insertOne({ _id: "gazetteer", files: { "cities1000.zip": { sha256: "abcdef0123456789ff" } } } as never);
 });

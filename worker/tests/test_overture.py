@@ -238,8 +238,8 @@ def test_checkpoint_resume_uses_the_same_release_without_duplicates(db, settings
     class Crash(BaseException):
         pass
 
-    def crash(jobs, job_id, key, value):
-        real_save(jobs, job_id, key, value)
+    def crash(jobs, job_id, key, value, **kw):
+        real_save(jobs, job_id, key, value, **kw)
         if key == "overture" and value.get("position"):
             saves.append(1)
             if len(saves) == 2:

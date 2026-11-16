@@ -4,6 +4,7 @@ import { Fragment, useCallback, useEffect, useState } from "react";
 import EmptyState from "@/components/EmptyState";
 import GoogleUsagePanel, { useGoogleUsage } from "@/components/GoogleUsagePanel";
 import { CATEGORIES } from "@/lib/categories";
+import { safeHref } from "@/components/leads/shared";
 
 type Status = "queued" | "running" | "completed" | "partial" | "failed" | "cancelled";
 type Job = {
@@ -402,11 +403,14 @@ function JobDetails({ job }: { job: Job }) {
               {log.map((e, i) => (
                 <li key={i} className="rounded border border-line bg-surface px-3 py-1.5">
                   <span className="font-medium">{STAGE_NAMES[e.stage] ?? e.stage}:</span> {e.message}
-                  {e.url && (
-                    <a href={e.url} target="_blank" rel="noopener noreferrer nofollow" className="ml-1 break-all text-canvas underline">
+                  {e.url && (safeHref(e.url) ? (
+                    // the URL comes from map data / websites: only http(s) becomes a link (see safeHref)
+                    <a href={safeHref(e.url)} target="_blank" rel="noopener noreferrer nofollow" className="ml-1 break-all text-canvas underline">
                       {e.url}
                     </a>
-                  )}
+                  ) : (
+                    <span className="ml-1 break-all text-muted">{e.url}</span>
+                  ))}
                   <span className="ml-2 text-xs text-muted">{new Date(e.at).toLocaleTimeString()}</span>
                 </li>
               ))}

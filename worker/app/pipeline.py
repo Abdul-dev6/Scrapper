@@ -38,6 +38,10 @@ class JobCancelled(Exception):
     pass
 
 
+class WorkerStopping(Exception):
+    """The worker got SIGTERM (e.g. a redeploy): stop at the next progress report and hand the job back."""
+
+
 class TransientJobError(RuntimeError):
     """A temporary problem (e.g. the map server is down): the job is retried later from its checkpoint."""
 
@@ -59,6 +63,7 @@ def is_transient(exc: BaseException) -> bool:
 NOMINATIM_LIMITER = RateLimiter(min_interval=0)
 log = logging.getLogger(__name__)
 SAVE_PROGRESS_EVERY = 25
+RENEW_PINS_SECONDS = 60  # reader pins last 15 min; renewing them more often only costs database writes
 OVERTURE_WRITE_BATCH = 500  # Overture leads per batched MongoDB write (2 round trips per batch)
 _BOUNDARIES: Boundaries | None = None
 
@@ -106,11 +111,13 @@ def run_job(
     usage: UsageLimiter | None = None,
     extract_filter: osm_extracts.FilterFn | None = None,
     overture_query: ov_places.QueryFn | None = None,
+    stop: Callable[[], bool] | None = None,
 ) -> str:
     """Run a job and return its final status: 'completed' or 'partial'.
 
-    Raise JobCancelled if the user cancels, any other exception to fail the job
-    (its message is shown to the user, so keep messages friendly).
+    Raise JobCancelled if the user cancels, WorkerStopping if stop() becomes true (checked at every
+    progress report), jobs.LeaseLost if another worker took the job over, and any other exception to
+    fail the job (its message is shown to the user, so keep messages friendly).
     """
     if not settings.crawler_contact_url:
         raise RuntimeError("CRAWLER_CONTACT_URL is not set in worker/.env. OpenStreetMap requires a contact.")
@@ -120,7 +127,7 @@ def run_job(
                        transport=google_transport, sleep=sleep)
     try:
         return _run(db, job, settings, client, sleep or time.sleep, limiter or NOMINATIM_LIMITER,
-                    web_transport, mx_resolve, google, host_resolve, extract_filter, overture_query)
+                    web_transport, mx_resolve, google, host_resolve, extract_filter, overture_query, stop)
     finally:
         google.close()  # also stops the Google thread if the job was cancelled or crashed
         if own_client:
@@ -129,12 +136,15 @@ def run_job(
 
 def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, sleep, limiter,
          web_transport=None, mx_resolve=None, google: GoogleRun | None = None, host_resolve=None,
-         extract_filter=None, overture_query=None) -> str:
+         extract_filter=None, overture_query=None, stop=None) -> str:
     jobs = db.scrapingJobs
     job_id, owner_id = job["_id"], job["ownerId"]
+    lease = job.get("lease")  # fences heartbeats + checkpoints (see jobs.LeaseLost)
 
     def progress(**kw) -> None:
-        if not q.heartbeat(jobs, job_id, **kw):
+        if stop is not None and stop():
+            raise WorkerStopping()
+        if not q.heartbeat(jobs, job_id, lease=lease, **kw):
             raise JobCancelled()
 
     # A retried or restarted job continues from its checkpoint instead of starting over.
@@ -224,7 +234,7 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
             pins = cache.ensure(regions, job_id=job_id, heartbeat=lambda: progress(),
                                 on_stage=lambda st: progress(stage=st))
             saved = {"extracts": [p.as_checkpoint() for p in pins], "index": 0, "position": 0, "counters": counters()}
-            q.save_checkpoint(jobs, job_id, "osm", saved)
+            q.save_checkpoint(jobs, job_id, "osm", saved, lease=lease)
         if pins:
             jobs.update_one({"_id": job_id}, {"$set": {"location.osmExtract": {
                 "provider": "geofabrik", "license": "ODbL 1.0 (OpenStreetMap contributors)",
@@ -243,6 +253,18 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
                      pct=10 + osm_share * min(1.0, done_before / total))
             for i, element in osm_extracts.read_elements(cache.abs(pin.file), start):
                 processed += 1
+                # At the top of the loop: every element before i is fully handled, so a restart continues
+                # at i. (At the bottom, every `continue` below skipped it: a city search in a country
+                # extract skips ~99% of the elements, so progress, Cancel and checkpoints were rare.)
+                if processed % SAVE_PROGRESS_EVERY == 0:
+                    _save_stats(jobs, job_id, stats)
+                    q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k, "position": i, "counters": counters()},
+                                      lease=lease)
+                    progress(pct=10 + osm_share * min(1.0, (done_before + i - start) / total),
+                             processed=processed, total=total, stage=f"Processing gyms: {stats['discovered']} found")
+                    if time.monotonic() - last_renew > RENEW_PINS_SECONDS:
+                        cache.renew(pins)  # long jobs keep their files pinned
+                        last_renew = time.monotonic()
                 try:
                     point = element if "lat" in element else element.get("center") or {}
                     if "lat" in point and not area.contains(float(point["lat"]), float(point["lon"])):
@@ -269,19 +291,11 @@ def _run(db: Database, job: dict, settings: Settings, client: httpx.Client, slee
                 except Exception as exc:  # one bad element must not lose the rest of the results
                     element_failures += 1
                     q.log_error(jobs, job_id, "save", f"{type(exc).__name__}: {exc}", url=mapping.osm_url(element))
-                if processed % SAVE_PROGRESS_EVERY == 0:
-                    _save_stats(jobs, job_id, stats)
-                    # Everything up to element i is saved: a restart continues at i + 1 (same version).
-                    q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k, "position": i + 1, "counters": counters()})
-                    progress(pct=10 + osm_share * min(1.0, (done_before + i - start + 1) / total),
-                             processed=processed, total=total, stage=f"Processing gyms: {stats['discovered']} found")
-                    if time.monotonic() - last_renew > 60:
-                        cache.renew(pins)  # long jobs keep their files pinned
-                        last_renew = time.monotonic()
             done_before += pin.features - start
             _save_stats(jobs, job_id, stats)
-            q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k + 1, "position": 0, "counters": counters()})
-        q.save_checkpoint(jobs, job_id, "osm", {**saved, "complete": True, "counters": counters()})
+            q.save_checkpoint(jobs, job_id, "osm", {**saved, "index": k + 1, "position": 0, "counters": counters()},
+                              lease=lease)
+        q.save_checkpoint(jobs, job_id, "osm", {**saved, "complete": True, "counters": counters()}, lease=lease)
     finally:
         for p in pins:
             cache.unpin(p)
@@ -349,6 +363,7 @@ def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, q
     Returns the number of elements that failed to save."""
     jobs = db.scrapingJobs
     job_id, owner_id = job["_id"], job["ownerId"]
+    lease = job.get("lease")
     keys = ("discovered", "withWebsite", "newLeads", "updated", "merged", "duplicates", "suppressed",
             "outsideArea", "otherCategory", "processed", "failures")
     saved = checkpoint.get("overture") or {}
@@ -361,7 +376,7 @@ def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, q
 
     def save_progress(extra: dict) -> None:
         jobs.update_one({"_id": job_id}, {"$set": {f"stats.overture.{k}": v for k, v in stats.items()}})
-        q.save_checkpoint(jobs, job_id, "overture", {**saved, **extra})
+        q.save_checkpoint(jobs, job_id, "overture", {**saved, **extra}, lease=lease)
 
     try:
         if saved.get("tiles") and not saved.get("complete"):
@@ -395,6 +410,7 @@ def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, q
         done = sum(p.features for p in pins[:first]) + saved.get("position", 0)
         release = saved.get("release", "")
         pending: list[tuple[dict, str]] = []  # (lead, provenance id) waiting for the next batched write
+        last_renew = time.monotonic()
 
         def flush() -> None:
             """Write the pending leads (one read + one bulk write). Per-lead problems are logged, not fatal."""
@@ -427,6 +443,14 @@ def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, q
             start = saved.get("position", 0) if k == first else 0
             for i, row in ov_places.read_rows(cache, pin, start):
                 stats["processed"] += 1
+                # At the top of the loop, so skipped rows (outside the area...) can't skip it (see the OSM stage).
+                if stats["processed"] % SAVE_PROGRESS_EVERY == 0:
+                    progress(pct=pct_from + (pct_to - pct_from) * min(1.0, (done + i - start) / total),
+                             stage=f"Processing Overture Maps gyms: {stats['discovered']} found")
+                    if time.monotonic() - last_renew > RENEW_PINS_SECONDS:
+                        # Was every 25 rows: one write per pinned tile each time (GB: 74 tiles x 1,774 = 131k writes).
+                        cache.renew(pins)
+                        last_renew = time.monotonic()
                 try:
                     if not area.contains(float(row["lat"]), float(row["lon"])):
                         stats["outsideArea"] += 1
@@ -455,10 +479,6 @@ def _overture_stage(db, job, settings, client, area, progress, hashes, wanted, q
                     flush()
                     # The checkpoint only moves past rows that are written (a restart redoes the rest).
                     save_progress({"index": k, "position": i + 1})
-                if stats["processed"] % SAVE_PROGRESS_EVERY == 0:
-                    progress(pct=pct_from + (pct_to - pct_from) * min(1.0, (done + i - start + 1) / total),
-                             stage=f"Processing Overture Maps gyms: {stats['discovered']} found")
-                    cache.renew(pins)
             flush()
             done += pin.features - start
             save_progress({"index": k + 1, "position": 0})

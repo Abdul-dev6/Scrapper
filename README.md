@@ -175,6 +175,29 @@ Overture Maps Places (Phase 2c, 2026-11-15), a separate "overture" data lane:
 - Dashboard: Source filter (All sources / OSM only / Overture only). Find Leads: OSM and Overture checkboxes.
 - Run `npm run db:indexes` once (new lead indexes + `overtureTiles`). Pilot: `worker/scripts/pilot_overture.py`.
 
+Phase 3 hardening (2026-11-16):
+- Job ownership: every claim gets a random `lease`; heartbeats, checkpoints and the final status are fenced
+  with it. A worker that was paused longer than `STALE_AFTER_SECONDS` (its job re-queued and claimed by
+  another worker) stops at its next progress report and writes nothing more to that job.
+- Redeploys: on SIGTERM the worker stops at its next progress report (usually within seconds) and hands the
+  job back at once with its checkpoint, without using up an attempt. Set Railway's draining time
+  (`RAILWAY_DEPLOYMENT_DRAINING_SECONDS`) to at least 30; a worker killed without notice is still recovered
+  after `STALE_AFTER_SECONDS` (that costs one attempt, as before).
+- Leads table: indexes for each sort (newest/oldest/name/confidence, and per data lane). Without them every
+  page sorted all of a user's leads in memory (41,756 leads: 1.4-2.2 s per page, now 15-30 ms locally).
+- Export: only the exported fields are read (cursor), and .xlsx is written with exceljs' streaming writer
+  (44,756 rows: 323 MB peak instead of 2.5 GB). `maxDuration` 60 s for the export route.
+- Login: besides 5 failures per account per network, at most 50 failed logins per network per 15 minutes.
+- Job limits (3 open, 10 per hour) are checked and the job created under a short per-user lock
+  (`jobStartLocks`), so simultaneous New search / Retry requests can't exceed them.
+- Sessions: tokens carry the user's `sessionVersion`; changing the password increments it, which signs out
+  every other browser (this one gets a fresh token). Tokens from before this change count as version 0.
+- Crawler: the email scan on page text is linear (it was quadratic on long letter runs: a 2 MB page took
+  minutes and stalled the whole crawl). Tested against a real local HTTP server (`worker/tests/test_crawl_http.py`).
+- End-to-end run against a local MongoDB with the pilots' real data: `worker/scripts/e2e_local.py`.
+- Run `npm run db:indexes` once: it creates `jobStartLocks`, builds the new sort indexes and drops the two indexes they replace
+  (`ownerId_1_dataLane_1_discoveredAt_-1`, `ownerId_1_nameNormalized_1`).
+
 ## Build steps
 1. ✅ Setup, models + indexes, auth, job queue
 2. ✅ OpenStreetMap discovery (Nominatim + Overpass)

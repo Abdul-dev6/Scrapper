@@ -60,6 +60,8 @@ before(async () => {
   ({ signSession } = await import("../../src/lib/session"));
   const { connectDB } = await import("../../src/lib/db");
   await connectDB();
+  // Sessions are only valid for users that exist (lib/auth.ts), so the test users exist.
+  await mongoose.connection.db!.collection("users").insertMany([{ _id: alice, email: `${alice}@test.test`, passwordHash: "x" }, { _id: mallory, email: `${mallory}@test.test`, passwordHash: "x" }] as never);
 });
 
 beforeEach(async () => {

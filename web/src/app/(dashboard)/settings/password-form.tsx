@@ -24,7 +24,7 @@ export default function PasswordForm() {
       setCurrent("");
       setNext("");
       setConfirm("");
-      return setMsg({ ok: true, text: "Password changed." });
+      return setMsg({ ok: true, text: "Password changed. You were signed out on all other devices." });
     }
     const body = await res?.json().catch(() => null);
     const field = body?.error?.details?.next?.[0];

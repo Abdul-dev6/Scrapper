@@ -214,7 +214,12 @@ class GeofabrikIndex:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(f".{uuid.uuid4().hex}.part")
                 tmp.write_bytes(resp.content)
-                os.replace(tmp, path)
+                try:
+                    os.replace(tmp, path)
+                except OSError:
+                    # Another job replaced/read the same file at this moment (Windows refuses to replace an
+                    # open file). The list we just downloaded is valid either way; only the cache copy waits.
+                    tmp.unlink(missing_ok=True)
                 return cls.parse(data)
             except (httpx.HTTPError, ValueError, ExtractUnavailable) as exc:
                 if not path.exists():
